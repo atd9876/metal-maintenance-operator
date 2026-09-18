@@ -189,7 +189,6 @@ func countJoin(cfg mmo.DashboardConfig, expr, kind, joinKey string) string {
 	return `count(` + expr + ` * on(` + joinKey + `) group_left() ` + ksmJoinExpr(cfg, kind, joinKey) + `) or vector(0)`
 }
 
-
 // withComplianceLabel adds a synthetic "compliance" label to every series:
 // "Non-Compliant" for state != "Completed", "Compliant" for state = "Completed".
 // The inner replace sets all non-empty states to Non-Compliant; the outer
