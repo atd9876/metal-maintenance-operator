@@ -3838,6 +3838,7 @@ spec:
             fieldRef:
               fieldPath: metadata.namespace
         image: controller:latest
+        imagePullPolicy: IfNotPresent
         livenessProbe:
           httpGet:
             path: /healthz

@@ -88,6 +88,10 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
 			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
 	esac
+	$(MAKE) docker-build IMG=$(IMG)
+	$(KIND) load docker-image $(IMG) --name $(KIND_CLUSTER)
+	@echo "Installing metal-operator CRDs from module cache..."
+	$(KUBECTL) apply -f "$$(go list -mod=mod -m -f '{{.Dir}}' github.com/ironcore-dev/metal-operator)/config/crd/bases/"
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
