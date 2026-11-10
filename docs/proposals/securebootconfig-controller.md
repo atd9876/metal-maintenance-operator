@@ -18,10 +18,9 @@ This document covers:
 - Interaction with `FirmwareUpdate` (disable-before-patch / re-enroll-after-patch)
 - `bmc/` interface additions required in metal-operator
 - Server label/condition surface exposed to metal-operator and `ServerClaim`
-- The signed probe image: construction, dual-role use, and validation semantics
 
-Out of scope: key generation, `db.auth` construction, attestation. Those are covered
-in `secure-boot-gardenlinux-v2.md`.
+Out of scope: key generation, `db.auth` construction (including option ROM
+fingerprinting), attestation. Those are covered in `secure-boot-gardenlinux-v2.md`.
 
 ---
 
@@ -103,31 +102,6 @@ type SecureBootConfigSpec struct {
     // +kubebuilder:validation:XValidation:rule="oldSelf == '' || self == oldSelf",message="completionConditionType is immutable once set"
     CompletionConditionType string `json:"completionConditionType,omitempty"`
 
-    // SecureBootProbeImageRef is the OCI image reference for a signed probe
-    // image used to validate end-to-end Secure Boot during the Enabling phase.
-    // The image must be PE-signed with a cert present in the cluster's db.auth
-    // so that UEFI will accept it under SB enforcement.
-    //
-    // The probe image serves two roles:
-    //   1. Bootstrap fingerprinting (pre-enrollment, unsigned run): boot the
-    //      image once per server model before SB is enforced to collect option
-    //      ROM PCR2 measurements and cert chains needed to build db.auth.
-    //   2. Post-enrollment validation (signed run): after the Enabling phase
-    //      reboot, UEFI either accepts or rejects the signed image. The
-    //      controller confirms success by reading SecureBootCurrentBoot=true
-    //      from the BMC — no phone-home from the image is required.
-    //
-    // The same image binary is used for both roles. Signing happens once at
-    // cluster bootstrap alongside operator key generation, producing a signed
-    // variant pushed to the cluster registry.
-    //
-    // If omitted, the controller skips the probe boot and reads
-    // SecureBootCurrentBoot directly from the BMC after the standard reboot.
-    // This is a weaker validation (confirms the SB flag is set but does not
-    // exercise the full signed boot chain) and is intended only as a fallback
-    // before the probe image is available.
-    // +optional
-    SecureBootProbeImageRef string `json:"secureBootProbeImageRef,omitempty"`
 }
 ```
 
@@ -274,14 +248,11 @@ exists. It does not scan for servers to act on.
 │                                                                             │
 │  Enabling (maintenance window C)                                            │
 │    PATCH SecureBootEnable=true                                              │
-│    if SecureBootProbeImageRef set:                                          │
-│      set Server.Spec.BootConfigurationRef to signed probe image             │
 │    reboot                                                                   │
 │    wait for Server.Status.PowerState=On                                     │
 │    verify GetSecureBootState returns CurrentBoot=true (direct BMC read)     │
-│      true  → SB validated end-to-end via signed probe boot chain           │
-│      false → Failed (SB flag set but boot chain rejected by UEFI)          │
-│    clear BootConfigurationRef (if probe image was set)                      │
+│      true  → SB active, enrollment confirmed                                │
+│      false → Failed (SB flag set but CurrentBoot not active)                │
 │    patch Server label: metal.ironcore.dev/secure-boot-enabled=true         │
 │    patch Server condition: CompletionConditionType=True (if set)            │
 │    release window C                   ──────────────────────────► Enabled  │
@@ -384,77 +355,155 @@ via Redfish `SecureBootDatabases`) is deferred — expensive and vendor support 
 inconsistent. The ResourceVersion approach covers the primary operational case
 with no extra BMC round-trips.
 
-### 5.3 Probe image
+---
 
-The `SecureBootProbeImageRef` image serves two roles across its lifecycle:
+## 6. Populating the `keySecretRef` Secret (prerequisite)
 
-**Role 1 — Pre-enrollment option ROM fingerprinting (run unsigned)**
+The controller treats the `keySecretRef` Secret as opaque pre-built input. Before
+a `SecureBootConfig` can be created, an operator must build the Secret and place
+it in the same namespace. This section documents that offline process.
 
-Before SB is enforced, boot the image on each server to determine which signing
-certs need to be in `db` for the PCIe cards present in that server. The image
-reads the TPM PCR2 event log (`/sys/kernel/security/tpm0/binary_bios_measurements`
-via `tpm2_eventlog`) and inspects PCI ROM binaries via `sbverify --list` to
-determine the signing cert chain for each card. The image runs *before* SB is
-enabled so no signing is required for this role.
+### 6.1 What the Secret must contain
 
-**Frequency and db construction:** Fingerprinting runs once per server. There is
-no automated way to determine upfront which servers have identical card
-configurations, so each server is treated independently. Results are merged: the
-cluster `db.auth` in `keySecretRef` is the **union across every server in the
-fleet**. Extra entries for cards a server does not have are harmless. The union
-`db.auth` is then enrolled on all servers identically.
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cluster-secureboot-keys
+  namespace: metal-operator-system
+type: Opaque
+data:
+  pk.auth:   <base64>   # operator PK, self-signed
+  kek.auth:  <base64>   # operator KEK, signed by operator PK
+  db.auth:   <base64>   # curated allow-list, signed by operator KEK
+  dbx.auth:  <base64>   # revocation list, signed by operator KEK (optional)
+```
 
-**Cert entries vs. hash entries per card:** For each card found during
-fingerprinting, the choice of `db` entry type depends on its signing chain:
+The Secret is **per-cluster**: PK and KEK are generated once per cluster and
+re-used across all `SecureBootConfig` resources. The `db.auth` is the union of
+all cert and hash entries needed across the entire fleet.
 
-- **`EFI_CERT_X509` (vendor cert):** used when the option ROM chains to a
-  vendor-owned cert (e.g. NVIDIA NDIS Device Identity root, Broadcom leaf). This
-  is the preferred approach — stable across card firmware updates and narrowly
-  scoped to that vendor.
-- **`EFI_CERT_SHA256` (binary hash):** used when the option ROM chains *only* to
-  the **Microsoft 3rd-party UEFI CA**. Enrolling that CA would be too broad —
-  it transitively trusts all firmware Microsoft has ever cosigned. In that case,
-  the specific ROM binary's SHA-256 hash is enrolled instead.
+### 6.2 Step 1 — Generate PK and KEK keypairs
 
-Hash entries are per-server (a different unit may have a different ROM version)
-and are invalidated by card firmware updates. This is an accepted cost; the
-alternative of enrolling the Microsoft CA is not acceptable given our trust model
-(see v2 proposal §2.5). Fingerprinting must be re-run after a card firmware
-update on any server carrying hash-based ROMs, and the cluster `db.auth` rebuilt.
+```bash
+# Platform Key
+openssl req -newkey rsa:2048 -nodes -keyout PK.key -new -x509 -sha256 \
+  -subj "/CN=Operator Platform Key" -out PK.crt
+# Key Exchange Key
+openssl req -newkey rsa:2048 -nodes -keyout KEK.key -new -x509 -sha256 \
+  -subj "/CN=Operator KEK" -out KEK.crt
+```
 
-Fingerprinting must also be re-run on each newly added server if it introduces a
-cert or hash not yet present in the union.
+Store `PK.key` and `KEK.key` sealed (e.g. cluster KMS / sealed secret). The
+`.crt` files are public and can be stored in version control.
 
-**Role 2 — Post-enrollment boot chain validation (run signed, after each
-enrollment)**
+### 6.3 Step 2 — Collect db entries from each server
 
-After `PATCH SecureBootEnable=true` and the `Enabling` phase reboot, the
-controller sets `Server.Spec.BootConfigurationRef` to boot the signed probe
-image. UEFI either accepts or rejects the image's boot chain against `db`. The
-controller observes the outcome purely from the BMC:
+For each server in the fleet, determine which entries are needed in `db`:
 
-- `Server.Status.PowerState` transitions to `On` — server came back up
-- `SecureBootInspector.GetSecureBootState` returns `CurrentBoot=true` — SB was
-  active on that boot (read directly from BMC, not from `Server.Status`)
+**GL bootloader cert** (same for all servers, all GL variants):
+```bash
+# Extract from a running GL OS
+sbverify --list /boot/efi/EFI/BOOT/BOOTX64.EFI | grep "^Certificate"
+# or from the GL release artefact directly
+```
 
-If both are true, the full signed boot chain validated. If `CurrentBoot` is
-`false` after the server comes back, the boot chain was rejected by UEFI (wrong
-cert, missing cert, or tampered binary) and the controller transitions to
-`Failed`. No phone-home from the image is required — UEFI's accept/reject
-decision is already reflected in `CurrentBoot`.
+**Option ROM entries** — for each server, inspect each PCIe card's option ROM:
+```bash
+# From the running OS, extract ROM via sysfs
+for dev in /sys/bus/pci/devices/*/rom; do
+  echo 1 > "$dev"
+  sbverify --list "$(dirname $dev)/rom" 2>/dev/null
+  echo 0 > "$dev"
+done
+```
 
-**Image construction**
+For each ROM found:
+- If it chains to a vendor-owned cert (NVIDIA, Broadcom, etc.): record the cert
+- If it chains only to the Microsoft 3rd-party UEFI CA: record the ROM's
+  SHA-256 hash instead (see v2 proposal §2.5 for rationale)
 
-The probe image is a minimal Linux image containing `tpm2-tools`, `tpm2-tss`,
-`lspci`, and `sbsigntools`. It is built once and shared across both roles. At
-cluster bootstrap, alongside operator key generation, the image's bootloader and
-UKI are PE-signed with the operator db key and pushed to the cluster registry as
-the `SecureBootProbeImageRef`. The unsigned build artifact is retained as the
-operator fingerprinting tool; the signed registry image is the validation probe.
+Repeat on every server. The fleet `db` is the **union** of all entries collected.
+
+### 6.4 Step 3 — Build the db ESL
+
+```bash
+GUID="$(uuidgen)"
+
+# GL bootloader cert
+cert-to-efi-sig-list -g "$GUID" gl-db.crt gl-db.esl
+
+# Vendor cert entries (one per distinct signing cert found)
+cert-to-efi-sig-list -g "$GUID" nvidia.crt nvidia.esl
+cert-to-efi-sig-list -g "$GUID" broadcom.crt broadcom.esl
+
+# Hash entries for ROMs that only chain to Microsoft CA
+# hash-to-efi-sig-list is a helper that wraps the EFI_CERT_SHA256 format
+hash-to-efi-sig-list rom1.hash rom1.esl
+hash-to-efi-sig-list rom2.hash rom2.esl
+
+# Combine into one db ESL
+cat gl-db.esl nvidia.esl broadcom.esl rom1.esl rom2.esl > db.esl
+```
+
+### 6.5 Step 4 — Sign all four .auth payloads
+
+```bash
+TIMESTAMP="$(date -u +%FT%TZ)"   # must be monotonically increasing
+
+# PK (self-signed)
+sign-efi-sig-list -t "$TIMESTAMP" -k PK.key -c PK.crt pk PK.esl pk.auth
+
+# KEK (signed by PK)
+cert-to-efi-sig-list -g "$GUID" KEK.crt KEK.esl
+sign-efi-sig-list -t "$TIMESTAMP" -k PK.key -c PK.crt kek KEK.esl kek.auth
+
+# db (signed by KEK)
+sign-efi-sig-list -t "$TIMESTAMP" -k KEK.key -c KEK.crt db db.esl db.auth
+
+# dbx (signed by KEK, optional)
+sign-efi-sig-list -t "$TIMESTAMP" -k KEK.key -c KEK.crt dbx dbx.esl dbx.auth
+```
+
+> **Timestamp anti-replay:** the `-t` timestamp is part of the signed data.
+> Each update to a variable must use a timestamp strictly newer than the
+> currently installed value. Use a monotonically increasing value; re-using a
+> timestamp from a previous enrollment will be rejected by the firmware.
+
+### 6.6 Step 5 — Create the Kubernetes Secret
+
+```bash
+kubectl create secret generic cluster-secureboot-keys \
+  --namespace metal-operator-system \
+  --from-file=pk.auth=pk.auth \
+  --from-file=kek.auth=kek.auth \
+  --from-file=db.auth=db.auth \
+  --from-file=dbx.auth=dbx.auth   # omit if no revocations
+```
+
+Reference it in `SecureBootConfig.spec.keySecretRef.name`.
+
+### 6.7 Updating the Secret (adding a new server or rotating keys)
+
+When a new server is added that introduces a new cert or hash not yet in the
+fleet `db`:
+
+1. Collect the new entries from the new server (§6.3)
+2. Rebuild `db.esl` as the new union (§6.4)
+3. Re-sign `db.auth` with a newer timestamp (§6.5) — PK and KEK are unchanged
+4. Update the Secret: `kubectl create secret generic … --dry-run=client -o yaml | kubectl apply -f -`
+5. The controller detects the Secret `ResourceVersion` change, sets
+   `SecureBootDrifted=True` on all affected `SecureBootConfig` resources, and
+   waits for the `re-enroll` annotation before acting
+
+For a full key rotation (PK/KEK compromise): regenerate all four payloads,
+update the Secret, and note that servers still holding the old PK will require
+a Setup-Mode transition (see v2 proposal §2.3 key-loss table).
 
 ---
 
-## 6. Maintenance Window Sequencing
+## 7. Maintenance Window Sequencing
+
 
 Each active phase (ClearingKeys, Enrolling, Enabling) holds exactly one
 `ServerMaintenance` object. The window is created at phase entry, used for its
@@ -494,7 +543,7 @@ power healing on the MO side are suspended while parked.
 
 ---
 
-## 7. Firmware Update Interaction
+## 8. Firmware Update Interaction
 
 ### 7.1 The correct ordering
 
@@ -557,7 +606,7 @@ objects. The actor that changes `spec.desiredState` to `Disabled` is:
 
 ---
 
-## 8. `bmc/` Interface Additions (metal-operator)
+## 9. `bmc/` Interface Additions (metal-operator)
 
 Two narrow interfaces are added to `metal-operator/bmc/bmc.go`.
 
@@ -619,7 +668,7 @@ Vendor implementation notes:
 
 ---
 
-## 9. Server Label and Condition Surface
+## 10. Server Label and Condition Surface
 
 The `SecureBootConfig` controller writes two things onto the `Server` object that
 MO and `ServerClaim` scheduling can consume.
@@ -672,7 +721,7 @@ spec:
 
 ---
 
-## 10. Controller Struct and Watches
+## 11. Controller Struct and Watches
 
 ```go
 type SecureBootConfigReconciler struct {
@@ -702,7 +751,7 @@ directly against the BMC rather than reading `Server.Status`.
 
 ---
 
-## 11. Reconciler Skeleton
+## 12. Reconciler Skeleton
 
 ```go
 func (r *SecureBootConfigReconciler) Reconcile(ctx, req) (ctrl.Result, error) {
@@ -743,7 +792,7 @@ func (r *SecureBootConfigReconciler) transitionState(ctx, sbc) (bool, error) {
 
 ---
 
-## 12. Open Questions
+## 13. Open Questions
 
 These are deferred from the initial implementation:
 
@@ -761,7 +810,4 @@ These are deferred from the initial implementation:
   (leaving SB enabled but unmanaged) or should it first disable SB? Current
   proposal: delete the object without disabling SB — SB state is persistent in
   firmware NVRAM and the server is leaving the cluster anyway.
-- **Probe image PCR2 output format:** define the structured format the probe
-  image uses to report option ROM measurements (JSON to a known endpoint, or
-  written to a well-known path the operator retrieves). Needed before the
-  fingerprinting role can be automated rather than driven manually.
+
