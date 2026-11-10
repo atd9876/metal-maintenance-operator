@@ -19,8 +19,8 @@ This document covers:
 - `bmc/` interface additions required in metal-operator
 - Server label/condition surface exposed to metal-operator and `ServerClaim`
 
-Out of scope: key generation, `db.auth` construction (including option ROM
-fingerprinting), attestation. Those are covered in `secure-boot-gardenlinux-v2.md`.
+Out of scope: PK/KEK key generation, option ROM fingerprinting, attestation. Those are covered
+in `secure-boot-gardenlinux-v2.md` and `secureboot-setup.md`.
 
 ---
 
@@ -62,10 +62,11 @@ type SecureBootConfigSpec struct {
     // +required
     ServerRef *corev1.LocalObjectReference `json:"serverRef"`
 
-    // KeySecretRef names the cluster-scoped Secret holding pre-signed .auth
-    // payloads: pk.auth, kek.auth, db.auth, and optionally dbx.auth.
-    // The Secret is read at enrollment time; rotating it and patching
-    // DesiredState back to Enabled triggers re-enrollment.
+    // KeySecretRef names the Secret holding the Secure Boot key material.
+    // The Secret must contain pk.crt, kek.crt, and one or more db.crt.N
+    // and/or db.sha256.N entries (see §6 for the full key naming convention).
+    // The Secret is read at enrollment time; updating it and annotating with
+    // metal.ironcore.dev/operation=re-enroll triggers re-enrollment.
     // +required
     KeySecretRef corev1.LocalObjectReference `json:"keySecretRef"`
 
@@ -239,7 +240,7 @@ exists. It does not scan for servers to act on.
 │    release window A                   ──────────────────────────► Enrolling│
 │                                                                             │
 │  Enrolling (maintenance window B)                                           │
-│    POST pk.auth → POST kek.auth → POST db.auth → POST dbx.auth (optional)  │
+│    POST pk.crt → POST kek.crt → POST db.crt.* → POST db.sha256.*          │
 │    reboot  →  verify UserMode (operator owns PK)                            │
 │    release window B                   ──────────────────────────► Enrolled │
 │                                                                             │
@@ -365,6 +366,10 @@ it in the same namespace. This section documents that offline process.
 
 ### 6.1 What the Secret must contain
 
+The Redfish `SecureBootDatabases` API accepts individual PEM certificates and
+SHA-256 hashes — not pre-signed `.auth` blobs. The Secret therefore contains
+raw key material, one entry per Secret key:
+
 ```yaml
 apiVersion: v1
 kind: Secret
@@ -373,15 +378,28 @@ metadata:
   namespace: metal-operator-system
 type: Opaque
 data:
-  pk.auth:   <base64>   # operator PK, self-signed
-  kek.auth:  <base64>   # operator KEK, signed by operator PK
-  db.auth:   <base64>   # curated allow-list, signed by operator KEK
-  dbx.auth:  <base64>   # revocation list, signed by operator KEK (optional)
+  pk.crt:       <base64 PEM>   # operator Platform Key cert
+  kek.crt:      <base64 PEM>   # operator Key Exchange Key cert
+  db.crt.0:     <base64 PEM>   # GL bootloader signing cert
+  db.crt.1:     <base64 PEM>   # NVIDIA option ROM signing cert
+  db.crt.2:     <base64 PEM>   # Broadcom option ROM signing cert
+  db.sha256.0:  <base64 hex>   # SHA-256 hash of a ROM that only chains to MS CA
+  db.sha256.1:  <base64 hex>   # … additional ROM hashes
+  dbx.sha256.0: <base64 hex>   # revoked binary hash (optional)
 ```
 
+Key naming rules:
+- `pk.crt` and `kek.crt` are fixed single keys
+- `db.crt.N` — any suffix after `db.crt.` is valid; order is not significant
+- `db.sha256.N` — any suffix after `db.sha256.` is valid
+- `dbx.sha256.N` — optional revocation hashes
+- Private keys (`pk.key`, `kek.key`) are **not** stored in this Secret — they
+  are only needed when the PK/KEK certs themselves were generated and are not
+  required by the controller for Redfish enrollment
+
 The Secret is **per-cluster**: PK and KEK are generated once per cluster and
-re-used across all `SecureBootConfig` resources. The `db.auth` is the union of
-all cert and hash entries needed across the entire fleet.
+re-used across all `SecureBootConfig` resources. The `db` entries are the union
+of all certs and hashes needed across the entire fleet.
 
 ### 6.2 Step 1 — Generate PK and KEK keypairs
 
@@ -425,80 +443,43 @@ For each ROM found:
 
 Repeat on every server. The fleet `db` is the **union** of all entries collected.
 
-### 6.4 Step 3 — Build the db ESL
+### 6.4 Step 3 — Collect the db entries into the Secret
 
+For each cert found:
 ```bash
-GUID="$(uuidgen)"
-
-# GL bootloader cert
-cert-to-efi-sig-list -g "$GUID" gl-db.crt gl-db.esl
-
-# Vendor cert entries (one per distinct signing cert found)
-cert-to-efi-sig-list -g "$GUID" nvidia.crt nvidia.esl
-cert-to-efi-sig-list -g "$GUID" broadcom.crt broadcom.esl
-
-# Hash entries for ROMs that only chain to Microsoft CA
-# hash-to-efi-sig-list is a helper that wraps the EFI_CERT_SHA256 format
-hash-to-efi-sig-list rom1.hash rom1.esl
-hash-to-efi-sig-list rom2.hash rom2.esl
-
-# Combine into one db ESL
-cat gl-db.esl nvidia.esl broadcom.esl rom1.esl rom2.esl > db.esl
-```
-
-### 6.5 Step 4 — Sign all four .auth payloads
-
-```bash
-TIMESTAMP="$(date -u +%FT%TZ)"   # must be monotonically increasing
-
-# PK (self-signed)
-sign-efi-sig-list -t "$TIMESTAMP" -k PK.key -c PK.crt pk PK.esl pk.auth
-
-# KEK (signed by PK)
-cert-to-efi-sig-list -g "$GUID" KEK.crt KEK.esl
-sign-efi-sig-list -t "$TIMESTAMP" -k PK.key -c PK.crt kek KEK.esl kek.auth
-
-# db (signed by KEK)
-sign-efi-sig-list -t "$TIMESTAMP" -k KEK.key -c KEK.crt db db.esl db.auth
-
-# dbx (signed by KEK, optional)
-sign-efi-sig-list -t "$TIMESTAMP" -k KEK.key -c KEK.crt dbx dbx.esl dbx.auth
-```
-
-> **Timestamp anti-replay:** the `-t` timestamp is part of the signed data.
-> Each update to a variable must use a timestamp strictly newer than the
-> currently installed value. Use a monotonically increasing value; re-using a
-> timestamp from a previous enrollment will be rejected by the firmware.
-
-### 6.6 Step 5 — Create the Kubernetes Secret
-
-```bash
+# number sequentially starting from 0
 kubectl create secret generic cluster-secureboot-keys \
-  --namespace metal-operator-system \
-  --from-file=pk.auth=pk.auth \
-  --from-file=kek.auth=kek.auth \
-  --from-file=db.auth=db.auth \
-  --from-file=dbx.auth=dbx.auth   # omit if no revocations
+  --from-file=pk.crt=PK.crt \
+  --from-file=kek.crt=KEK.crt \
+  --from-literal=db.crt.0="$(cat gl-db.crt)" \
+  --from-literal=db.crt.1="$(cat nvidia.crt)" \
+  --from-literal=db.crt.2="$(cat broadcom.crt)" \
+  --from-literal=db.sha256.0="b1ee3fa0e98fadd50e6457ef739f018580ab6e9ed..." \
+  --from-literal=db.sha256.1="9f3a2c..." \
+  --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-Reference it in `SecureBootConfig.spec.keySecretRef.name`.
+Adding a new cert or hash = adding a new `db.crt.N` or `db.sha256.N` key and
+applying the updated Secret. No signing step is required.
 
-### 6.7 Updating the Secret (adding a new server or rotating keys)
+### 6.5 Updating the Secret (adding a new server or rotating keys)
 
-When a new server is added that introduces a new cert or hash not yet in the
-fleet `db`:
+When a new server introduces a cert or hash not yet in the fleet `db`:
 
 1. Collect the new entries from the new server (§6.3)
-2. Rebuild `db.esl` as the new union (§6.4)
-3. Re-sign `db.auth` with a newer timestamp (§6.5) — PK and KEK are unchanged
-4. Update the Secret: `kubectl create secret generic … --dry-run=client -o yaml | kubectl apply -f -`
-5. The controller detects the Secret `ResourceVersion` change, sets
-   `SecureBootDrifted=True` on all affected `SecureBootConfig` resources, and
-   waits for the `re-enroll` annotation before acting
+2. Add new `db.crt.N` / `db.sha256.N` keys to the Secret
+3. Apply the updated Secret — Kubernetes increments its `ResourceVersion`
+4. The controller detects the change, sets `SecureBootDrifted=True` on all
+   affected `SecureBootConfig` resources, and waits for the
+   `metal.ironcore.dev/operation=re-enroll` annotation before acting
 
-For a full key rotation (PK/KEK compromise): regenerate all four payloads,
-update the Secret, and note that servers still holding the old PK will require
-a Setup-Mode transition (see v2 proposal §2.3 key-loss table).
+For a full key rotation (PK/KEK compromise): replace `pk.crt` and `kek.crt`,
+and note that servers still holding the old PK require a Setup-Mode transition
+before the new PK can be enrolled (see v2 proposal §2.3 key-loss table).
+
+> **Private keys** (`PK.key`, `KEK.key`) are generated when creating the certs
+> but are **not** stored in `keySecretRef`. They are not needed by the
+> controller. Store them separately, sealed (cluster KMS / sealed secret).
 
 ---
 
@@ -636,9 +617,15 @@ type SecureBootState struct {
 type SecureBootManager interface {
     SecureBootInspector
 
-    // EnrollSecureBootAuth posts a pre-signed EFI_VARIABLE_AUTHENTICATION_2
-    // blob to the named database (pk, kek, db, dbx).
-    EnrollSecureBootAuth(ctx context.Context, systemURI, database string, authBlob []byte) error
+    // EnrollCertificate posts a PEM certificate to the named Secure Boot
+    // database (pk, kek, db, dbx) via the Redfish SecureBootDatabases
+    // Certificates endpoint.
+    EnrollCertificate(ctx context.Context, systemURI, database, pemCert string) error
+
+    // EnrollHash posts a SHA-256 hash to the named Secure Boot database
+    // via the Redfish SecureBootDatabases Signatures endpoint.
+    // hash must be a 64-character lowercase hex string.
+    EnrollHash(ctx context.Context, systemURI, database, hash string) error
 
     // ResetSecureBootKeys resets one or more key databases.
     ResetSecureBootKeys(ctx context.Context, systemURI string, resetType SecureBootResetType) error
@@ -651,17 +638,25 @@ type SecureBootManager interface {
 type SecureBootResetType string
 
 const (
-    SecureBootResetDeletePK           SecureBootResetType = "DeletePK"
-    SecureBootResetDeleteAllKeys      SecureBootResetType = "DeleteAllKeys"
+    SecureBootResetDeletePK              SecureBootResetType = "DeletePK"
+    SecureBootResetDeleteAllKeys         SecureBootResetType = "DeleteAllKeys"
     SecureBootResetResetAllKeysToDefault SecureBootResetType = "ResetAllKeysToDefault"
 )
 ```
 
 Vendor implementation notes:
-- **Dell iDRAC:** key enrollment may be queued as a Lifecycle Controller job;
-  `EnrollSecureBootAuth` must poll the job to completion before returning.
-- **HPE iLO:** a BIOS (not BMC) reset is required to commit key changes; the
-  controller's reboot step covers this.
+- **Dell iDRAC:** `EnrollCertificate` posts to `.../Certificates` with
+  `{"CertificateString": "<PEM>", "CertificateType": "PEM"}`. `EnrollHash`
+  posts to `.../Signatures` with `{"SignatureTypeRegistry": "UEFI",
+  "SignatureType": "EFI_CERT_SHA256_GUID", "SignatureOwner":
+  "00000000-0000-0000-0000-000000000000", "SignatureString": "<hex>"}`.
+  Both return `SYS430` on success. All changes are staged and applied on reboot.
+  Note: after reboot the `Certificates` and `Signatures` endpoints return
+  `count: 0` due to a known iDRAC bug — verify via OS efivars instead.
+- **HPE iLO:** same endpoint structure as Dell. PK enrollment requires a
+  session token (`X-Auth-Token`) — Basic auth returns 401. All SB changes are
+  deferred to reboot; never reboot mid-sequence between enrollment calls and the
+  `SetSecureBootEnabled` call.
 - **Lenovo XCC:** does not support Redfish-based Secure Boot key enrollment.
   Configuration is only possible via the F1 firmware setup menu. Lenovo servers
   are out of scope for automated `SecureBootConfig` enrollment.
