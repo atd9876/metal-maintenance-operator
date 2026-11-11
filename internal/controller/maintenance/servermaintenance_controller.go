@@ -472,12 +472,23 @@ func (r *ServerMaintenanceReconciler) removeBootConfigRefFromServer(ctx context.
 }
 
 func (r *ServerMaintenanceReconciler) unparkServerForMaintenance(ctx context.Context, server *metalv1alpha1.Server) error {
-	serverBase := server.DeepCopy()
-	metautils.DeleteAnnotation(server, controllerutils.ServerMaintenanceOwnerAnnotation)
-	metav1.SetMetaDataAnnotation(&server.ObjectMeta, metalv1alpha1.OperationAnnotation, metalv1alpha1.OperationAnnotationUnpark)
-	if err := r.Patch(ctx, server, client.MergeFrom(serverBase)); err != nil && !apierrors.IsNotFound(err) {
+	latest := server.DeepCopy()
+	if err := r.Get(ctx, client.ObjectKeyFromObject(server), latest); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to re-fetch server for unpark: %w", err)
+	}
+	serverBase := latest.DeepCopy()
+	metautils.DeleteAnnotation(latest, controllerutils.ServerMaintenanceOwnerAnnotation)
+	metav1.SetMetaDataAnnotation(&latest.ObjectMeta, metalv1alpha1.OperationAnnotation, metalv1alpha1.OperationAnnotationUnpark)
+	if err := r.Patch(ctx, latest, client.MergeFrom(serverBase)); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
 		return fmt.Errorf("failed to patch unpark request for server: %w", err)
 	}
+	*server = *latest
 	return nil
 }
 

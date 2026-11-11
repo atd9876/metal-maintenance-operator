@@ -528,6 +528,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err = (&systemctrl.SecureBootConfigReconciler{
+		Client:             mgr.GetClient(),
+		ManagerNamespace:   managerNamespace,
+		DefaultProtocol:    protocol,
+		SkipCertValidation: skipCertValidation,
+		Scheme:             mgr.GetScheme(),
+		ResyncInterval:     resyncInterval,
+		Conditions:         accessor,
+		BMCOptions:         bmcOpts,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create SecureBootConfig controller")
+		os.Exit(1)
+	}
+
+	if err = (&systemctrl.SecureBootConfigSetReconciler{
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		ResyncInterval: resyncInterval,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create SecureBootConfigSet controller")
+		os.Exit(1)
+	}
+
 	if err = (&systemctrl.BIOSSettingsSetReconciler{
 		Client:         mgr.GetClient(),
 		Scheme:         mgr.GetScheme(),

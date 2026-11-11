@@ -98,5 +98,22 @@ func RegisterAll(ctx context.Context, indexer client.FieldIndexer) error {
 		return err
 	}
 
+	if err := indexer.IndexField(
+		ctx,
+		&systemv1alpha1.SecureBootConfig{},
+		constants.ServerRefField,
+		func(rawObj client.Object) []string {
+			sbc, ok := rawObj.(*systemv1alpha1.SecureBootConfig)
+			if !ok {
+				return nil
+			}
+			if sbc.Spec.ServerRef != nil && sbc.Spec.ServerRef.Name != "" {
+				return []string{sbc.Spec.ServerRef.Name}
+			}
+			return nil
+		}); err != nil {
+		return err
+	}
+
 	return nil
 }

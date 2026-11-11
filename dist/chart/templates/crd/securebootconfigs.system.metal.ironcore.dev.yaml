@@ -1,0 +1,314 @@
+{{- if .Values.crd.enabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    {{- if .Values.crd.keep }}
+    "helm.sh/resource-policy": keep
+    {{- end }}
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: securebootconfigs.system.metal.ironcore.dev
+spec:
+  group: system.metal.ironcore.dev
+  names:
+    kind: SecureBootConfig
+    listKind: SecureBootConfigList
+    plural: securebootconfigs
+    shortNames:
+    - sbc
+    singular: securebootconfig
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.serverRef.name
+      name: Server
+      type: string
+    - jsonPath: .spec.desiredState
+      name: DesiredState
+      type: string
+    - jsonPath: .status.state
+      name: State
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: SecureBootConfig manages UEFI Secure Boot enrollment and state
+          on a single server.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: SecureBootConfigSpec defines the desired state of SecureBootConfig.
+            properties:
+              completionConditionType:
+                description: |-
+                  CompletionConditionType, if set, is the condition Type patched onto the
+                  Server once this resource reaches its terminal success state (Enabled or
+                  Disabled). Immutable once set.
+                type: string
+                x-kubernetes-validations:
+                - message: completionConditionType is immutable once set
+                  rule: oldSelf == '' || self == oldSelf
+              desiredState:
+                default: Enabled
+                description: DesiredState controls the top-level goal.
+                enum:
+                - Enabled
+                - Disabled
+                type: string
+              keySecretRef:
+                description: |-
+                  KeySecretRef names the Secret holding the Secure Boot key material.
+                  The Secret must contain pk.crt, kek.crt, and one or more db.crt.N
+                  and/or db.sha256.N entries. Updating the Secret and annotating with
+                  metal.ironcore.dev/operation=re-enroll triggers re-enrollment.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              progressDeadlineSeconds:
+                default: 3600
+                description: |-
+                  ProgressDeadlineSeconds is the maximum time in seconds to wait without
+                  observable forward progress before the resource is marked Failed.
+                format: int32
+                type: integer
+              readinessGates:
+                description: |-
+                  ReadinessGates lists Server conditions that must be True before this
+                  controller starts acting. Evaluated once at the Pending→active boundary.
+                items:
+                  description: |-
+                    ConditionRequirement defines a specific Server condition and the status value
+                    required to trigger the controller's action.
+                  properties:
+                    requiredStatus:
+                      description: RequiredStatus is status of the condition, one
+                        of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: |-
+                        Type of server condition
+
+                        Following kubebuilder validation is referred from https://pkg.go.dev/k8s.io/apimachinery/pkg/apis/meta/v1#Condition
+                      maxLength: 316
+                      minLength: 1
+                      type: string
+                  required:
+                  - requiredStatus
+                  - type
+                  type: object
+                type: array
+              retryPolicy:
+                description: RetryPolicy defines automatic retry behaviour on transient
+                  failures.
+                properties:
+                  maxAttempts:
+                    description: |-
+                      MaxAttempts is the maximum number of automatic retry attempts after failure.
+                      0 means no automatic retries. Must be between 0 and 10 inclusive.
+                      If not set, the operator-level default is used.
+                    format: int32
+                    maximum: 10
+                    minimum: 0
+                    type: integer
+                type: object
+              serverMaintenancePolicy:
+                default: Enforced
+                description: |-
+                  ServerMaintenancePolicy controls whether maintenance windows require
+                  owner approval before the server is parked.
+                enum:
+                - OwnerApproval
+                - Enforced
+                type: string
+              serverRef:
+                description: ServerRef is the server to manage Secure Boot on. Immutable
+                  once set.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+                x-kubernetes-validations:
+                - message: serverRef is immutable
+                  rule: self == oldSelf
+            required:
+            - keySecretRef
+            - serverRef
+            type: object
+          status:
+            description: SecureBootConfigStatus defines the observed state of SecureBootConfig.
+            properties:
+              conditions:
+                description: Conditions holds per-phase conditions for observability.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              currentMode:
+                description: CurrentMode is the SecureBootMode last read from the
+                  BMC.
+                type: string
+              enabledKeySecret:
+                description: |-
+                  EnabledKeySecret records the ResourceVersion of the KeySecretRef Secret
+                  at the time of the last successful enrollment, used to detect when the
+                  Secret has been updated and re-enrollment is needed.
+                type: string
+              failedAttempts:
+                description: FailedAttempts counts automatic retries after entering
+                  Failed state.
+                format: int32
+                type: integer
+              lastEnabledTime:
+                description: LastEnabledTime is when the Enabled state was last reached.
+                format: date-time
+                type: string
+              lastProgressTime:
+                description: |-
+                  LastProgressTime records the last observed forward progress, used with
+                  ProgressDeadlineSeconds to detect stalled reconciliation.
+                format: date-time
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the spec generation last acted
+                  on.
+                format: int64
+                type: integer
+              rebootIssuedForState:
+                description: |-
+                  RebootIssuedForState records the State in which the last BMC reboot was
+                  issued, used to determine whether the post-reboot verification phase has
+                  been reached. Reset to "" whenever State advances to a new value.
+                enum:
+                - Pending
+                - ClearingKeys
+                - Enrolling
+                - Enrolled
+                - Enabling
+                - Enabled
+                - Disabled
+                - Failed
+                type: string
+              serverMaintenanceRef:
+                description: ServerMaintenanceRef is the maintenance window currently
+                  held, if any.
+                properties:
+                  name:
+                    description: Name is the name of the referenced object.
+                    type: string
+                  namespace:
+                    description: Namespace is the namespace of the referenced object.
+                    type: string
+                required:
+                - name
+                - namespace
+                type: object
+              state:
+                description: State is the current reconciliation state.
+                enum:
+                - Pending
+                - ClearingKeys
+                - Enrolling
+                - Enrolled
+                - Enabling
+                - Enabled
+                - Disabled
+                - Failed
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+{{- end }}

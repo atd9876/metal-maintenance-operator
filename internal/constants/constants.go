@@ -77,6 +77,14 @@ const (
 	ConditionReady                       = "Ready"
 	ConditionRetryOfFailedResourceIssued = "RetryOfFailedResourceIssued"
 	ConditionProgressDeadlineExceeded    = "ProgressDeadlineExceeded"
+
+	// SecureBootConfig-specific condition types.
+	ConditionSBKeysCleared      = "KeysCleared"
+	ConditionSBKeysEnrolled     = "KeysEnrolled"
+	ConditionSBEnabled          = "SecureBootEnabled"
+	ConditionSBDrifted          = "SecureBootDrifted"
+	ConditionSBReadinessGates   = "ReadinessGatesSatisfied"
+	ConditionSBRebootIssued     = "SecureBootRebootIssued"
 )
 
 // Shared reason strings used across baseboard and system controllers.
@@ -104,4 +112,17 @@ const (
 	ReasonMaintenanceApproved         = "ServerMaintenanceApproval"
 	ReasonRetryOfFailedResourceIssued = "RetryOfFailedResourceIssued"
 	ReasonProgressDeadlineExceeded    = "ProgressDeadlineExceeded"
+
+	// SecureBootConfig-specific reasons.
+	ReasonSBKeysCleared         = "KeysCleared"
+	ReasonSBKeysEnrolled        = "KeysEnrolled"
+	ReasonSBEnabled             = "SecureBootEnabled"
+	ReasonSBDriftHardware       = "HardwareChange"
+	ReasonSBDriftSecret         = "KeySecretUpdated"
+	ReasonSBReadinessUnsatisfied = "ReadinessGatesUnsatisfied"
+	ReasonSBReadinessSatisfied   = "ReadinessGatesSatisfied"
+	ReasonSBRebootIssued        = "RebootIssued"
+	ReasonSBEnrollFailed        = "EnrollmentFailed"
+	ReasonSBClearFailed         = "ClearKeysFailed"
+	ReasonSBNotSupported        = "SecureBootNotSupported"
 )
