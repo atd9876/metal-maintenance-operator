@@ -6,6 +6,7 @@ package system
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"path/filepath"
 	"runtime"
@@ -333,4 +334,172 @@ func EnsureCleanState() {
 			g.Expect(items).To(BeEmpty())
 		}).Should(Succeed())
 	}
+}
+
+// SetupTestWithMock is identical to SetupTest(nil) except that each test gets its
+// own MockServer bound to a randomly-assigned free port instead of sharing port
+// 8200.  This eliminates all BMC lock contention and stale-goroutine interference
+// between tests that issue power operations.
+//
+// Returns:
+//   - ns: namespace, populated before each test (same as SetupTest)
+//   - ms: *MockServer, populated before each test body runs
+//   - msPort: int32 port, populated before each test body runs
+//
+// In test bodies use *ms and *msPort.
+func SetupTestWithMock(mockServerOpts ...mockserver.Option) (*corev1.Namespace, **mockserver.MockServer, *int32) {
+	ms := new(*mockserver.MockServer)
+	port := new(int32)
+	ns := &corev1.Namespace{}
+
+	BeforeEach(func(ctx SpecContext) {
+		mgrCtx, cancel := context.WithCancel(context.Background())
+		DeferCleanup(cancel)
+
+		// Pick a free port for this test's isolated mock server.
+		*port = int32(freePort())
+
+		*ns = corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "test-"},
+		}
+		Expect(k8sClient.Create(ctx, ns)).To(Succeed(), "failed to create test namespace")
+		DeferCleanup(k8sClient.Delete, ns)
+
+		k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
+			Scheme: scheme.Scheme,
+			Controller: config.Controller{
+				SkipNameValidation: new(true),
+			},
+			Metrics: metricsserver.Options{BindAddress: "0"},
+		})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(registerIndexFields(mgrCtx, k8sManager.GetFieldIndexer())).To(Succeed())
+
+		accessor := conditionutils.NewAccessor(conditionutils.AccessorOptions{})
+
+		Expect((&BIOSSettingsReconciler{
+			Client:             k8sManager.GetClient(),
+			ManagerNamespace:   ns.Name,
+			DefaultProtocol:    metalv1alpha1.HTTPProtocolScheme,
+			SkipCertValidation: true,
+			Scheme:             k8sManager.GetScheme(),
+			ResyncInterval:     10 * time.Millisecond,
+			Conditions:         accessor,
+			BMCOptions: bmc.Options{
+				PowerPollingInterval: 50 * time.Millisecond,
+				PowerPollingTimeout:  200 * time.Millisecond,
+				BasicAuth:            true,
+			},
+			TimeoutExpiry:       6 * time.Second,
+			RebootTimeoutExpiry: 6 * time.Second,
+		}).SetupWithManager(k8sManager)).To(Succeed())
+
+		Expect((&BIOSVersionReconciler{
+			Client:             k8sManager.GetClient(),
+			ManagerNamespace:   ns.Name,
+			DefaultProtocol:    metalv1alpha1.HTTPProtocolScheme,
+			SkipCertValidation: true,
+			Scheme:             k8sManager.GetScheme(),
+			ResyncInterval:     10 * time.Millisecond,
+			Conditions:         accessor,
+			BMCOptions: bmc.Options{
+				PowerPollingInterval: 50 * time.Millisecond,
+				PowerPollingTimeout:  200 * time.Millisecond,
+				BasicAuth:            true,
+			},
+			RebootTimeoutExpiry: 6 * time.Second,
+		}).SetupWithManager(k8sManager)).To(Succeed())
+
+		Expect((&BIOSSettingsSetReconciler{
+			Client:         k8sManager.GetClient(),
+			Scheme:         k8sManager.GetScheme(),
+			ResyncInterval: 10 * time.Millisecond,
+		}).SetupWithManager(k8sManager)).To(Succeed())
+
+		Expect((&BIOSVersionSetReconciler{
+			Client:         k8sManager.GetClient(),
+			Scheme:         k8sManager.GetScheme(),
+			ResyncInterval: 10 * time.Millisecond,
+		}).SetupWithManager(k8sManager)).To(Succeed())
+
+		Expect((&maintenancectrl.ServerMaintenanceReconciler{
+			Client: k8sManager.GetClient(),
+			Scheme: k8sManager.GetScheme(),
+		}).SetupWithManager(k8sManager)).To(Succeed())
+
+		Expect((&FirmwareUpdateReconciler{
+			Client:             k8sManager.GetClient(),
+			ManagerNamespace:   ns.Name,
+			DefaultProtocol:    metalv1alpha1.HTTPProtocolScheme,
+			SkipCertValidation: true,
+			Scheme:             k8sManager.GetScheme(),
+			ResyncInterval:     10 * time.Millisecond,
+			Conditions:         accessor,
+			BMCOptions: bmc.Options{
+				PowerPollingInterval: 50 * time.Millisecond,
+				PowerPollingTimeout:  200 * time.Millisecond,
+				BasicAuth:            true,
+			},
+			MaxRepositoryPasses: 5,
+		}).SetupWithManager(k8sManager)).To(Succeed())
+
+		Expect((&simcontrollers.BMCReconciler{
+			Client:             k8sManager.GetClient(),
+			DefaultProtocol:    metalv1alpha1.HTTPProtocolScheme,
+			SkipCertValidation: true,
+			ResyncInterval:     10 * time.Millisecond,
+			BMCOptions: bmc.Options{
+				PowerPollingInterval: 50 * time.Millisecond,
+				PowerPollingTimeout:  200 * time.Millisecond,
+				BasicAuth:            true,
+			},
+		}).SetupWithManager(k8sManager)).To(Succeed())
+
+		Expect((&simcontrollers.ServerReconciler{
+			Client:             k8sManager.GetClient(),
+			DefaultProtocol:    metalv1alpha1.HTTPProtocolScheme,
+			SkipCertValidation: true,
+			ResyncInterval:     10 * time.Millisecond,
+			BMCOptions: bmc.Options{
+				PowerPollingInterval: 50 * time.Millisecond,
+				PowerPollingTimeout:  200 * time.Millisecond,
+				BasicAuth:            true,
+			},
+		}).SetupWithManager(k8sManager)).To(Succeed())
+
+		Expect((&simcontrollers.ServerClaimReconciler{
+			Client:         k8sManager.GetClient(),
+			ResyncInterval: 10 * time.Millisecond,
+		}).SetupWithManager(k8sManager)).To(Succeed())
+
+		opts := append([]mockserver.Option{mockserver.WithAuth()}, mockServerOpts...)
+		addr := fmt.Sprintf(":%d", *port)
+		By(fmt.Sprintf("Starting isolated mock Redfish server on %s", addr))
+		*ms = mockserver.NewMockServer(GinkgoLogr, addr, opts...)
+		Expect(k8sManager.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			if err := (*ms).Start(ctx); err != nil {
+				return fmt.Errorf("failed to start mock Redfish server: %w", err)
+			}
+			<-ctx.Done()
+			return nil
+		}))).Should(Succeed())
+
+		go func() {
+			defer GinkgoRecover()
+			Expect(k8sManager.Start(mgrCtx)).To(Succeed(), "failed to start manager")
+		}()
+	})
+
+	return ns, ms, port
+}
+
+// freePort pre-allocates a TCP port on localhost and returns it.
+func freePort() int {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(fmt.Sprintf("freePort: %v", err))
+	}
+	p := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return p
 }
