@@ -336,28 +336,31 @@ func EnsureCleanState() {
 	}
 }
 
-// SetupTestWithMock is identical to SetupTest(nil) except that each test gets its
-// own MockServer bound to a randomly-assigned free port instead of sharing port
-// 8200.  This eliminates all BMC lock contention and stale-goroutine interference
-// between tests that issue power operations.
+// SetupTestWithMock creates an isolated test environment with n independent
+// MockServers, each bound to a randomly-assigned free port.  Using a fresh set
+// of servers per test eliminates BMC lock contention and stale-goroutine
+// interference between tests that issue power operations.
 //
 // Returns:
-//   - ns: namespace, populated before each test (same as SetupTest)
-//   - ms: *MockServer, populated before each test body runs
-//   - msPort: int32 port, populated before each test body runs
+//   - ns:       namespace, populated before each test body runs
+//   - msList:   slice of n *MockServer values, populated before each test body
+//   - portList: slice of n int32 port values, populated before each test body
 //
-// In test bodies use *ms and *msPort.
-func SetupTestWithMock(mockServerOpts ...mockserver.Option) (*corev1.Namespace, **mockserver.MockServer, *int32) {
-	ms := new(*mockserver.MockServer)
-	port := new(int32)
+// In test bodies dereference the pointers: (*msList)[i] and (*portList)[i].
+func SetupTestWithMock(n int, mockServerOpts ...mockserver.Option) (*corev1.Namespace, *[]*mockserver.MockServer, *[]int32) {
+	msList := new([]*mockserver.MockServer)
+	portList := new([]int32)
 	ns := &corev1.Namespace{}
 
 	BeforeEach(func(ctx SpecContext) {
 		mgrCtx, cancel := context.WithCancel(context.Background())
 		DeferCleanup(cancel)
 
-		// Pick a free port for this test's isolated mock server.
-		*port = int32(freePort())
+		ports := make([]int32, n)
+		for i := range ports {
+			ports[i] = int32(freePort())
+		}
+		*portList = ports
 
 		*ns = corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{GenerateName: "test-"},
@@ -473,16 +476,21 @@ func SetupTestWithMock(mockServerOpts ...mockserver.Option) (*corev1.Namespace, 
 		}).SetupWithManager(k8sManager)).To(Succeed())
 
 		opts := append([]mockserver.Option{mockserver.WithAuth()}, mockServerOpts...)
-		addr := fmt.Sprintf(":%d", *port)
-		By(fmt.Sprintf("Starting isolated mock Redfish server on %s", addr))
-		*ms = mockserver.NewMockServer(GinkgoLogr, addr, opts...)
-		Expect(k8sManager.Add(manager.RunnableFunc(func(ctx context.Context) error {
-			if err := (*ms).Start(ctx); err != nil {
-				return fmt.Errorf("failed to start mock Redfish server: %w", err)
-			}
-			<-ctx.Done()
-			return nil
-		}))).Should(Succeed())
+		servers := make([]*mockserver.MockServer, n)
+		for i, p := range ports {
+			addr := fmt.Sprintf(":%d", p)
+			By(fmt.Sprintf("Starting isolated mock Redfish server %d on %s", i, addr))
+			ms := mockserver.NewMockServer(GinkgoLogr, addr, opts...)
+			servers[i] = ms
+			Expect(k8sManager.Add(manager.RunnableFunc(func(ctx context.Context) error {
+				if err := ms.Start(ctx); err != nil {
+					return fmt.Errorf("failed to start mock Redfish server: %w", err)
+				}
+				<-ctx.Done()
+				return nil
+			}))).Should(Succeed())
+		}
+		*msList = servers
 
 		go func() {
 			defer GinkgoRecover()
@@ -490,7 +498,7 @@ func SetupTestWithMock(mockServerOpts ...mockserver.Option) (*corev1.Namespace, 
 		}()
 	})
 
-	return ns, ms, port
+	return ns, msList, portList
 }
 
 // freePort pre-allocates a TCP port on localhost and returns it.

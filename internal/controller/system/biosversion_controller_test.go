@@ -30,7 +30,7 @@ import (
 )
 
 var _ = Describe("BIOSVersion Controller", func() {
-	ns := SetupTest(nil)
+	ns, msList, portList := SetupTestWithMock(1)
 
 	var (
 		server    *metalv1alpha1.Server
@@ -61,7 +61,7 @@ var _ = Describe("BIOSVersion Controller", func() {
 				BMC: &metalv1alpha1.BMCAccess{
 					Protocol: metalv1alpha1.Protocol{
 						Name: metalv1alpha1.ProtocolRedfishLocal,
-						Port: MockServerPort,
+						Port: (*portList)[0],
 					},
 					Address: MockServerIP,
 					BMCSecretRef: v1.LocalObjectReference{
@@ -82,7 +82,7 @@ var _ = Describe("BIOSVersion Controller", func() {
 		Expect(k8sClient.Delete(ctx, server)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, bmcSecret)).To(Succeed())
 		EnsureCleanState()
-		mockServers[0].ResetUpgradeTask(server.Spec.SystemURI)
+		(*msList)[0].ResetUpgradeTask(server.Spec.SystemURI)
 	})
 
 	It("should successfully mark completed if no BIOS version change", func(ctx SpecContext) {
@@ -406,7 +406,7 @@ var _ = Describe("BIOSVersion Controller", func() {
 })
 
 var _ = Describe("BIOSVersion Controller with BMCRef BMC", func() {
-	ns := SetupTest(nil)
+	ns, msList, portList := SetupTestWithMock(1)
 
 	var (
 		server    *metalv1alpha1.Server
@@ -436,7 +436,7 @@ var _ = Describe("BIOSVersion Controller with BMCRef BMC", func() {
 				},
 				Protocol: metalv1alpha1.Protocol{
 					Name: metalv1alpha1.ProtocolRedfishLocal,
-					Port: MockServerPort,
+					Port: (*portList)[0],
 				},
 				BMCSecretRef: v1.LocalObjectReference{
 					Name: bmcSecret.Name,
@@ -464,7 +464,7 @@ var _ = Describe("BIOSVersion Controller with BMCRef BMC", func() {
 		Expect(k8sClient.Delete(ctx, bmcObj)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, bmcSecret)).To(Succeed())
 		EnsureCleanState()
-		mockServers[0].ResetUpgradeTask(server.Spec.SystemURI)
+		(*msList)[0].ResetUpgradeTask(server.Spec.SystemURI)
 	})
 	It("should successfully Start and monitor Upgrade task to completion", func(ctx SpecContext) {
 		// mocked at

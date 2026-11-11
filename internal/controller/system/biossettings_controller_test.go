@@ -33,7 +33,7 @@ import (
 )
 
 var _ = Describe("BIOSSettings Controller", func() {
-	ns := SetupTest(nil)
+	ns, msList, portList := SetupTestWithMock(1)
 
 	var (
 		server      *metalv1alpha1.Server
@@ -65,7 +65,7 @@ var _ = Describe("BIOSSettings Controller", func() {
 				BMC: &metalv1alpha1.BMCAccess{
 					Protocol: metalv1alpha1.Protocol{
 						Name: metalv1alpha1.ProtocolRedfishLocal,
-						Port: MockServerPort,
+						Port: (*portList)[0],
 					},
 					Address: MockServerIP,
 					BMCSecretRef: v1.LocalObjectReference{
@@ -86,7 +86,7 @@ var _ = Describe("BIOSSettings Controller", func() {
 		Expect(k8sClient.Delete(ctx, bmcSecret)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, server)).To(Succeed())
 		EnsureCleanState()
-		mockServers[0].ResetBIOSSettings(path.Base(server.Spec.SystemURI))
+		(*msList)[0].ResetBIOSSettings(path.Base(server.Spec.SystemURI))
 	})
 
 	It("should successfully patch its reference to referred server", func(ctx SpecContext) {
@@ -939,7 +939,7 @@ var _ = Describe("BIOSSettings Controller", func() {
 })
 
 var _ = Describe("BIOSSettings Controller with BMCRef BMC", func() {
-	ns := SetupTest(nil)
+	ns, msList, portList := SetupTestWithMock(1)
 
 	var (
 		server      *metalv1alpha1.Server
@@ -969,7 +969,7 @@ var _ = Describe("BIOSSettings Controller with BMCRef BMC", func() {
 				},
 				Protocol: metalv1alpha1.Protocol{
 					Name: metalv1alpha1.ProtocolRedfishLocal,
-					Port: MockServerPort,
+					Port: (*portList)[0],
 				},
 				BMCSecretRef: v1.LocalObjectReference{
 					Name: bmcSecret.Name,
@@ -993,7 +993,7 @@ var _ = Describe("BIOSSettings Controller with BMCRef BMC", func() {
 	})
 
 	AfterEach(func(ctx SpecContext) {
-		mockServers[0].ResetBIOSSettings(path.Base(server.Spec.SystemURI))
+		(*msList)[0].ResetBIOSSettings(path.Base(server.Spec.SystemURI))
 
 		Expect(k8sClient.Delete(ctx, bmcSecret)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, bmcObj)).To(Succeed())
@@ -1185,7 +1185,7 @@ var _ = Describe("BIOSSettings Controller with BMCRef BMC", func() {
 		)
 
 		By("Creating pending changes on the mock server via HTTP PATCH")
-		pendingSettingsURL := fmt.Sprintf("http://%s:%d/redfish/v1/Systems/437XR1138R2/Bios/Settings", MockServerIP, MockServerPort)
+		pendingSettingsURL := fmt.Sprintf("http://%s:%d/redfish/v1/Systems/437XR1138R2/Bios/Settings", MockServerIP, (*portList)[0])
 		pendingData := map[string]any{
 			"Attributes": map[string]any{
 				"PendingSetting1": "PendingValue1",
@@ -1249,7 +1249,7 @@ var _ = Describe("BIOSSettings Controller with BMCRef BMC", func() {
 		)
 
 		By("Clearing pending changes on the mock server via HTTP DELETE")
-		clearPendingURL := fmt.Sprintf("http://%s:%d/redfish/v1/Systems/437XR1138R2/Bios/Settings", MockServerIP, MockServerPort)
+		clearPendingURL := fmt.Sprintf("http://%s:%d/redfish/v1/Systems/437XR1138R2/Bios/Settings", MockServerIP, (*portList)[0])
 		clearReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, clearPendingURL, nil)
 		Expect(err).NotTo(HaveOccurred())
 		clearReq.SetBasicAuth(string(bmcSecret.Data[metalv1alpha1.BMCSecretUsernameKeyName]), string(bmcSecret.Data[metalv1alpha1.BMCSecretPasswordKeyName]))
@@ -1277,7 +1277,7 @@ var _ = Describe("BIOSSettings Controller with BMCRef BMC", func() {
 })
 
 var _ = Describe("BIOSSettings Sequence Controller", func() {
-	ns := SetupTest(nil)
+	ns, msList, portList := SetupTestWithMock(1)
 
 	var (
 		server    *metalv1alpha1.Server
@@ -1308,7 +1308,7 @@ var _ = Describe("BIOSSettings Sequence Controller", func() {
 				BMC: &metalv1alpha1.BMCAccess{
 					Protocol: metalv1alpha1.Protocol{
 						Name: metalv1alpha1.ProtocolRedfishLocal,
-						Port: MockServerPort,
+						Port: (*portList)[0],
 					},
 					Address: MockServerIP,
 					BMCSecretRef: v1.LocalObjectReference{
@@ -1326,7 +1326,7 @@ var _ = Describe("BIOSSettings Sequence Controller", func() {
 	})
 
 	AfterEach(func(ctx SpecContext) {
-		mockServers[0].ResetBIOSSettings(path.Base(server.Spec.SystemURI))
+		(*msList)[0].ResetBIOSSettings(path.Base(server.Spec.SystemURI))
 
 		Expect(k8sClient.Delete(ctx, bmcSecret)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, server)).To(Succeed())

@@ -28,7 +28,7 @@ import (
 const dellSystemID = "437XR1138R2"
 
 var _ = Describe("FirmwareUpdate Controller", func() {
-	ns := SetupTest(nil, mockserver.WithSystemOverride(dellSystemID, map[string]any{"Manufacturer": "Dell Inc."}))
+	ns, msList, portList := SetupTestWithMock(1, mockserver.WithSystemOverride(dellSystemID, map[string]any{"Manufacturer": "Dell Inc."}))
 
 	var (
 		server    *metalv1alpha1.Server
@@ -62,7 +62,7 @@ var _ = Describe("FirmwareUpdate Controller", func() {
 					// always returns the vendor-neutral RedfishBaseBMC wrapper.
 					Protocol: metalv1alpha1.Protocol{
 						Name: metalv1alpha1.ProtocolRedfish,
-						Port: MockServerPort,
+						Port: (*portList)[0],
 					},
 					Address: MockServerIP,
 					BMCSecretRef: v1.LocalObjectReference{
@@ -92,7 +92,7 @@ var _ = Describe("FirmwareUpdate Controller", func() {
 		Expect(k8sClient.Delete(ctx, server)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, bmcSecret)).To(Succeed())
 		EnsureCleanState()
-		mockServers[0].ResetDellRepositoryUpdate()
+		(*msList)[0].ResetDellRepositoryUpdate()
 	})
 
 	It("should apply a pending repository firmware update through to completion", func(ctx SpecContext) {

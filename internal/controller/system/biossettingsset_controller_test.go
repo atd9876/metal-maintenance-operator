@@ -4,8 +4,6 @@
 package system
 
 import (
-	"fmt"
-	"net/netip"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -24,18 +22,14 @@ import (
 )
 
 var _ = Describe("BIOSSettingsSet Controller", func() {
+	_, msList, portList := SetupTestWithMock(3)
+
 	var (
-		MockServerIPAddrs = []netip.AddrPort{
-			netip.MustParseAddrPort(fmt.Sprintf("%s:%d", MockServerIP, MockServerPort)),
-			netip.MustParseAddrPort(fmt.Sprintf("%s:%d", MockServerIP, MockServerPort+1)),
-			netip.MustParseAddrPort(fmt.Sprintf("%s:%d", MockServerIP, MockServerPort+2)),
-		}
 		server01  *metalv1alpha1.Server
 		server02  *metalv1alpha1.Server
 		server03  *metalv1alpha1.Server
 		bmcSecret *metalv1alpha1.BMCSecret
 	)
-	_ = SetupTest(MockServerIPAddrs)
 
 	BeforeEach(func(ctx SpecContext) {
 		By("Creating a BMCSecret")
@@ -63,9 +57,9 @@ var _ = Describe("BIOSSettingsSet Controller", func() {
 				BMC: &metalv1alpha1.BMCAccess{
 					Protocol: metalv1alpha1.Protocol{
 						Name: metalv1alpha1.ProtocolRedfishLocal,
-						Port: int32(MockServerIPAddrs[0].Port()),
+						Port: (*portList)[0],
 					},
-					Address: MockServerIPAddrs[0].Addr().String(),
+					Address: MockServerIP,
 					BMCSecretRef: v1.LocalObjectReference{
 						Name: bmcSecret.Name,
 					},
@@ -87,9 +81,9 @@ var _ = Describe("BIOSSettingsSet Controller", func() {
 				BMC: &metalv1alpha1.BMCAccess{
 					Protocol: metalv1alpha1.Protocol{
 						Name: metalv1alpha1.ProtocolRedfishLocal,
-						Port: int32(MockServerIPAddrs[1].Port()),
+						Port: (*portList)[1],
 					},
-					Address: MockServerIPAddrs[1].Addr().String(),
+					Address: MockServerIP,
 					BMCSecretRef: v1.LocalObjectReference{
 						Name: bmcSecret.Name,
 					},
@@ -111,9 +105,9 @@ var _ = Describe("BIOSSettingsSet Controller", func() {
 				BMC: &metalv1alpha1.BMCAccess{
 					Protocol: metalv1alpha1.Protocol{
 						Name: metalv1alpha1.ProtocolRedfishLocal,
-						Port: int32(MockServerIPAddrs[2].Port()),
+						Port: (*portList)[2],
 					},
-					Address: MockServerIPAddrs[2].Addr().String(),
+					Address: MockServerIP,
 					BMCSecretRef: v1.LocalObjectReference{
 						Name: bmcSecret.Name,
 					},
@@ -140,7 +134,7 @@ var _ = Describe("BIOSSettingsSet Controller", func() {
 		Expect(k8sClient.Delete(ctx, server03)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, bmcSecret)).To(Succeed())
 		EnsureCleanState()
-		for _, ms := range mockServers {
+		for _, ms := range *msList {
 			ms.ResetBIOSSettings("437XR1138R2")
 		}
 	})
