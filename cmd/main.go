@@ -153,6 +153,9 @@ func main() {
 		"Number of automatic retries before a maintenance task is marked failed.")
 	flag.DurationVar(&biosSettingsTimeoutExpiry, "bios-settings-timeout-expiry", 30*time.Minute,
 		"Timeout for BIOS settings application before the task is considered expired.")
+	var sbPostStuckTimeout time.Duration
+	flag.DurationVar(&sbPostStuckTimeout, "sb-post-stuck-timeout", 10*time.Minute,
+		"How long to wait in Enabling (before reboot) before concluding the server is stuck in POST and issuing a ForceOff.")
 	flag.DurationVar(&rebootTimeoutExpiry, "reboot-timeout-expiry", 10*time.Minute,
 		"Timeout waiting for a server to complete a reboot/power-cycle before the task is considered expired.")
 	flag.IntVar(&maxRepositoryPasses, "max-repository-passes", maxRepositoryPassesLimit,
@@ -537,6 +540,7 @@ func main() {
 		ResyncInterval:     resyncInterval,
 		Conditions:         accessor,
 		BMCOptions:         bmcOpts,
+		PostStuckTimeout:   sbPostStuckTimeout,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create SecureBootConfig controller")
 		os.Exit(1)

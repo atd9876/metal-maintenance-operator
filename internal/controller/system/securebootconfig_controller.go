@@ -70,6 +70,10 @@ type SecureBootConfigReconciler struct {
 	BMCOptions         bmc.Options
 	ResyncInterval     time.Duration
 	Conditions         *conditionutils.Accessor
+	// PostStuckTimeout is how long the controller waits in Enabling (before the
+	// reboot is issued) before concluding the server is stuck in POST and issuing
+	// a ForceOff to unblock iLO.
+	PostStuckTimeout time.Duration
 }
 
 // +kubebuilder:rbac:groups=system.metal.ironcore.dev,resources=securebootconfigs,verbs=get;list;watch;create;update;patch;delete
@@ -494,6 +498,16 @@ func (r *SecureBootConfigReconciler) handleEnabling(ctx context.Context, sbc *sy
 	if sbc.Status.RebootIssuedForState != systemv1alpha1.SecureBootConfigStateEnabling {
 		if err := sbManager.SetSecureBootEnabled(ctx, server.Spec.SystemURI, true); err != nil {
 			if isBMCBusy(err) {
+				// If we have been blocked by POST for longer than PostStuckTimeout,
+				// the server has no boot target and will stay in POST indefinitely.
+				// Issue a ForceOff to let iLO exit POST so the next reconcile can
+				// succeed.
+				if r.postStuck(sbc) {
+					log.V(1).Info("Server stuck in POST — issuing ForceOff to unblock iLO", "error", err)
+					if offErr := bmcClient.ForcePowerOff(ctx, server.Spec.SystemURI); offErr != nil {
+						log.V(1).Info("ForceOff failed, will retry next reconcile", "error", offErr)
+					}
+				}
 				log.V(1).Info("BMC busy (503) during SetSecureBootEnabled(true) — retrying", "error", err)
 				return nil
 			}
@@ -1002,6 +1016,15 @@ func (r *SecureBootConfigReconciler) patchCompletionCondition(ctx context.Contex
 // ──────────────────────────────────────────────────────────────────────────────
 // BMC client helpers
 // ──────────────────────────────────────────────────────────────────────────────
+
+// postStuck returns true when the SBC has been in the pre-reboot Enabling phase
+// for longer than PostStuckTimeout, indicating the server is stuck in POST.
+func (r *SecureBootConfigReconciler) postStuck(sbc *systemv1alpha1.SecureBootConfig) bool {
+	if r.PostStuckTimeout <= 0 || sbc.Status.LastProgressTime == nil {
+		return false
+	}
+	return time.Since(sbc.Status.LastProgressTime.Time) > r.PostStuckTimeout
+}
 
 // getBMCClient returns a BMC client. Returns (nil, nil, false, nil) when the BMC
 // is unavailable (caller should requeue). Returns (nil, nil, false, err) on
