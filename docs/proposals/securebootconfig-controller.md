@@ -41,7 +41,7 @@ Controller path: `internal/controller/system/securebootconfig_controller.go`
 
 ```go
 // SecureBootDesiredState is the top-level goal for the controller.
-// +kubebuilder:validation:Enum=Enabled;Disabled
+// +kubebuilder:validation:Enum=Enabled;Disabled;FactoryDefault
 type SecureBootDesiredState string
 
 const (
@@ -53,6 +53,20 @@ const (
     // Boot and clear all key databases. Used before firmware updates to prevent
     // a firmware NVRAM reset from leaving the server in an inconsistent state.
     SecureBootDesiredStateDisabled SecureBootDesiredState = "Disabled"
+
+    // SecureBootDesiredStateFactoryDefault instructs the controller to restore
+    // the vendor's factory key set via the Redfish ResetAllKeysToDefault action.
+    // Unlike Disabled (which empties every database), this repopulates PK/KEK/db
+    // with the vendor defaults — including the Microsoft UEFI CA. On Dell the
+    // reset leaves Secure Boot enabled against the restored keys, so the
+    // controller additionally disables Secure Boot; the end-state is: factory
+    // keys present, Secure Boot disabled.
+    //
+    // This is the ideal pre-firmware-update state for Microsoft-signed payloads:
+    // the factory db trusts the vendor/Microsoft signing certs, while Secure Boot
+    // enforcement is off so the update cannot be blocked. It is also the state to
+    // hand a server back to when decommissioning it to its shipped key set.
+    SecureBootDesiredStateFactoryDefault SecureBootDesiredState = "FactoryDefault"
 )
 
 // SecureBootConfigSpec defines the desired state of SecureBootConfig.
@@ -120,6 +134,14 @@ const (
     SecureBootConfigStateEnabling     SecureBootConfigState = "Enabling"
     SecureBootConfigStateEnabled      SecureBootConfigState = "Enabled"
     SecureBootConfigStateDisabled     SecureBootConfigState = "Disabled"
+    // ResettingKeys is the active phase for DesiredState=FactoryDefault:
+    // ResetAllKeysToDefault is issued, then a reboot confirms the factory keys
+    // are restored and Secure Boot is disabled.
+    SecureBootConfigStateResettingKeys  SecureBootConfigState = "ResettingKeys"
+    // FactoryDefault is the terminal success state for DesiredState=FactoryDefault:
+    // vendor factory keys restored (incl. the Microsoft UEFI CA) and Secure Boot
+    // disabled — the ideal state for applying a Microsoft-signed firmware payload.
+    SecureBootConfigStateFactoryDefault SecureBootConfigState = "FactoryDefault"
     SecureBootConfigStateFailed       SecureBootConfigState = "Failed"
 )
 
@@ -234,6 +256,7 @@ exists. It does not scan for servers to act on.
 │    └─ UserMode, foreign PK or SB off                  ──────────► Clearing │
 │                                                                             │
 │  ClearingKeys (maintenance window A)                                        │
+│    EnsureCustomKeyPolicy (PATCH SecureBootPolicy=Custom if needed)          │
 │    PATCH SecureBootEnable=false                                             │
 │    ResetKeys: db, dbx, KEK, then PK  →  SetupMode                          │
 │    reboot  →  verify SetupMode                                              │
@@ -272,6 +295,7 @@ exists. It does not scan for servers to act on.
 │    └─ SB on or keys present                            ────────► Clearing  │
 │                                                                             │
 │  ClearingKeys (maintenance window)                                          │
+│    EnsureCustomKeyPolicy (PATCH SecureBootPolicy=Custom if needed)          │
 │    PATCH SecureBootEnable=false                                             │
 │    ResetKeys: db, dbx, KEK, then PK  →  SetupMode                          │
 │    reboot  →  verify SetupMode + SB off                                     │
@@ -283,7 +307,29 @@ exists. It does not scan for servers to act on.
 │    spec.DesiredState patched to Enabled  →  Pending                        │
 │                                                                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│  Failed (both paths)                                                        │
+│  DesiredState = FactoryDefault                                              │
+│                                                                             │
+│  Pending ──inspect BMC──────────────────────────────────────────────────── │
+│    │  already factory: factory keys present + SB off + no operator PK  ──►  │
+│    │                                                         FactoryDefault │
+│    └─ otherwise (operator keys present, SB on, etc.)      ──► ResettingKeys │
+│                                                                             │
+│  ResettingKeys (maintenance window)                                         │
+│    ResetKeys: ResetAllKeysToDefault  →  restores vendor PK/KEK/db          │
+│    SetSecureBootEnable=false  (Dell leaves SB ON after the reset, so we    │
+│      explicitly disable it — FactoryDefault must end with SB OFF)          │
+│    reboot (ForceRestart)  →  verify SB off + factory keys present          │
+│    patch Server label: metal.ironcore.dev/secure-boot-enabled=false        │
+│    patch Server condition: CompletionConditionType=True (if set)           │
+│    release window                     ─────────────────────────► FactoryDefault│
+│                                                                             │
+│  FactoryDefault (terminal success for DesiredState=FactoryDefault)          │
+│    factory keys restored, Secure Boot off (ready for MS-signed firmware)   │
+│    spec.DesiredState patched to Enabled   →  Pending (re-enroll our keys)  │
+│    spec.DesiredState patched to Disabled  →  Pending (wipe to SetupMode)   │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Failed (all paths)                                                         │
 │    FailedAttempts < RetryPolicy.MaxAttempts  →  auto-retry to Pending       │
 │    FailedAttempts exhausted: stays Failed; manual retry via                 │
 │      metal.ironcore.dev/operation=retry annotation                          │
@@ -605,6 +651,8 @@ type SecureBootState struct {
     Enabled       bool   // SecureBootEnable (persisted flag)
     EnabledOnBoot bool   // SecureBootCurrentBoot (was SB active on last boot?)
     Mode          string // SetupMode | UserMode | AuditMode | DeployedMode
+    Policy        string // vendor Secure Boot policy, e.g. Dell "Standard" | "Custom".
+                         // Empty if the vendor does not expose a policy attribute.
 }
 ```
 
@@ -630,6 +678,16 @@ type SecureBootManager interface {
     // ResetSecureBootKeys resets one or more key databases.
     ResetSecureBootKeys(ctx context.Context, systemURI string, resetType SecureBootResetType) error
 
+    // EnsureCustomKeyPolicy makes sure the platform allows enrollment of custom
+    // Secure Boot keys. On Dell this PATCHes the BIOS attribute
+    // SecureBootPolicy=Custom (a factory server ships in "Standard", where the
+    // custom databases are read-only and ResetKeys/EnrollCertificate are
+    // rejected or ignored). The change is staged and applied on the next reboot,
+    // so it folds into the ClearingKeys/ResettingKeys reboot. Implementations for
+    // vendors that have no such policy (or that always permit custom enrollment)
+    // return nil without acting.
+    EnsureCustomKeyPolicy(ctx context.Context, systemURI string) error
+
     // SetSecureBootEnabled patches SecureBootEnable on the BMC.
     SetSecureBootEnabled(ctx context.Context, systemURI string, enable bool) error
 }
@@ -645,6 +703,14 @@ const (
 ```
 
 Vendor implementation notes:
+- **Dell iDRAC:** `EnsureCustomKeyPolicy` PATCHes the BIOS attribute
+  `SecureBootPolicy` to `Custom` via `.../Bios/Settings` (factory default is
+  `Standard`, which makes PK/KEK/db/dbx read-only). `ResetAllKeysToDefault`
+  typically reverts `SecureBootPolicy` to `Standard`, so a re-enroll after a
+  `FactoryDefault` must set it back to `Custom` again — hence it is ensured at
+  the start of every `ClearingKeys`/`ResettingKeys` phase, not once. The PATCH is
+  staged and committed by the same reboot that applies the key changes.
+  `GetSecureBootState` reads `SecureBootPolicy` into `SecureBootState.Policy`.
 - **Dell iDRAC:** `EnrollCertificate` posts to `.../Certificates` with
   `{"CertificateString": "<PEM>", "CertificateType": "PEM"}`. `EnrollHash`
   posts to `.../Signatures` with `{"SignatureTypeRegistry": "UEFI",
@@ -674,6 +740,7 @@ MO and `ServerClaim` scheduling can consume.
 |---|---|---|
 | `metal.ironcore.dev/secure-boot-enabled` | `"true"` | Enabling phase completes (`Enabled` state reached) |
 | `metal.ironcore.dev/secure-boot-enabled` | `"false"` | ClearingKeys phase completes (`Disabled` state reached) |
+| `metal.ironcore.dev/secure-boot-enabled` | `"false"` | ResettingKeys phase completes (`FactoryDefault` state reached) — factory keys are restored and Secure Boot is disabled, so **our** operator Secure Boot is not in force |
 
 The MO server reconciler additionally writes:
 

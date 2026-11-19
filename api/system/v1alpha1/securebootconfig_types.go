@@ -13,16 +13,22 @@ import (
 )
 
 // SecureBootDesiredState is the top-level goal for the SecureBootConfig controller.
-// +kubebuilder:validation:Enum=Enabled;Disabled
+// +kubebuilder:validation:Enum=Enabled;Disabled;FactoryDefault
 type SecureBootDesiredState string
 
 const (
 	SecureBootDesiredStateEnabled  SecureBootDesiredState = "Enabled"
 	SecureBootDesiredStateDisabled SecureBootDesiredState = "Disabled"
+	// SecureBootDesiredStateFactoryDefault restores the vendor factory key set via
+	// ResetAllKeysToDefault. On the tested Dell this also leaves Secure Boot
+	// disabled, so the end-state is factory keys present (incl. the Microsoft UEFI
+	// CA) with Secure Boot off — the state to hand a server to before applying a
+	// Microsoft-signed firmware payload, or when returning it to its shipped state.
+	SecureBootDesiredStateFactoryDefault SecureBootDesiredState = "FactoryDefault"
 )
 
 // SecureBootConfigState is the top-level lifecycle state.
-// +kubebuilder:validation:Enum=Pending;ClearingKeys;Enrolling;Enrolled;Enabling;Enabled;Disabled;Failed
+// +kubebuilder:validation:Enum=Pending;ClearingKeys;Enrolling;Enrolled;Enabling;Enabled;Disabled;ResettingKeys;FactoryDefault;Failed
 type SecureBootConfigState string
 
 const (
@@ -33,7 +39,13 @@ const (
 	SecureBootConfigStateEnabling     SecureBootConfigState = "Enabling"
 	SecureBootConfigStateEnabled      SecureBootConfigState = "Enabled"
 	SecureBootConfigStateDisabled     SecureBootConfigState = "Disabled"
-	SecureBootConfigStateFailed       SecureBootConfigState = "Failed"
+	// ResettingKeys is the active phase for DesiredState=FactoryDefault: issue
+	// ResetAllKeysToDefault, reboot, then confirm Secure Boot is off with the
+	// factory keys restored.
+	SecureBootConfigStateResettingKeys SecureBootConfigState = "ResettingKeys"
+	// FactoryDefault is the terminal success state for DesiredState=FactoryDefault.
+	SecureBootConfigStateFactoryDefault SecureBootConfigState = "FactoryDefault"
+	SecureBootConfigStateFailed         SecureBootConfigState = "Failed"
 )
 
 // SecureBootConfigSpec defines the desired state of SecureBootConfig.

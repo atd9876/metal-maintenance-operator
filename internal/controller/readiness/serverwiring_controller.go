@@ -105,59 +105,25 @@ func (r *ServerWiringReconciler) reconcileExists(ctx context.Context, wiring *re
 	return ctrl.Result{}, r.updateStatus(ctx, wiring, ready, mismatches)
 }
 
-func (r *ServerWiringReconciler) validateServer(server *metalv1alpha1.Server, wiring *readinessv1alpha1.ServerWiring) (mismatches []readinessv1alpha1.InterfaceMismatch, ready bool) {
-	ready = true
-
+func (r *ServerWiringReconciler) validateServer(_ *metalv1alpha1.Server, wiring *readinessv1alpha1.ServerWiring) (mismatches []readinessv1alpha1.InterfaceMismatch, ready bool) {
+	// STUB(discovery-migration): metal-operator removed Server.Status.NetworkInterfaces
+	// (commit dc57e064). MMO has no observed-NIC producer yet, so there is nothing to
+	// validate the expected wiring against. Until the NIC-inventory source is reintroduced
+	// in MMO, report every expected interface as unverifiable so readiness stays honest.
+	// Revert this whole function body once an observed-NIC source exists.
 	if len(wiring.Spec.Network.Interfaces) == 0 {
 		return nil, true
 	}
 
-	actualByMAC := make(map[string]metalv1alpha1.NetworkInterface, len(server.Status.NetworkInterfaces))
-	for _, nic := range server.Status.NetworkInterfaces {
-		actualByMAC[strings.ToLower(nic.MACAddress)] = nic
-	}
-
 	for _, expected := range wiring.Spec.Network.Interfaces {
-		mac := strings.ToLower(expected.MACAddress)
-		actual, found := actualByMAC[mac]
-		if !found {
-			ready = false
-			mismatches = append(mismatches, readinessv1alpha1.InterfaceMismatch{
-				MACAddress: expected.MACAddress,
-				Reason:     reasonInterfaceMissing,
-				Message:    "interface not found",
-			})
-			continue
-		}
-
-		if expected.CarrierStatus != "" && actual.CarrierStatus != expected.CarrierStatus {
-			ready = false
-			mismatches = append(mismatches, readinessv1alpha1.InterfaceMismatch{
-				MACAddress: expected.MACAddress,
-				Reason:     reasonCarrierDown,
-				Message:    fmt.Sprintf("carrierStatus: expected %q, got %q", expected.CarrierStatus, actual.CarrierStatus),
-			})
-		}
-
-		type neighborKey struct{ system, port string }
-		actualNeighbors := make(map[neighborKey]struct{}, len(actual.Neighbors))
-		for _, n := range actual.Neighbors {
-			actualNeighbors[neighborKey{n.SystemName, n.PortID}] = struct{}{}
-		}
-		for _, expectedNeighbor := range expected.Neighbors {
-			key := neighborKey{expectedNeighbor.SystemName, expectedNeighbor.PortID}
-			if _, ok := actualNeighbors[key]; !ok {
-				ready = false
-				mismatches = append(mismatches, readinessv1alpha1.InterfaceMismatch{
-					MACAddress: expected.MACAddress,
-					Reason:     reasonNeighborMismatch,
-					Message:    fmt.Sprintf("LLDP neighbor not found: systemName=%q portID=%q", expectedNeighbor.SystemName, expectedNeighbor.PortID),
-				})
-			}
-		}
+		mismatches = append(mismatches, readinessv1alpha1.InterfaceMismatch{
+			MACAddress: expected.MACAddress,
+			Reason:     reasonInterfaceMissing,
+			Message:    "no observed network interface source available (discovery migration in progress)",
+		})
 	}
 
-	return mismatches, ready
+	return mismatches, false
 }
 
 func (r *ServerWiringReconciler) setNetworkReadyCondition(ctx context.Context, server *metalv1alpha1.Server, ready, hasSpec bool, mismatches []readinessv1alpha1.InterfaceMismatch) error {

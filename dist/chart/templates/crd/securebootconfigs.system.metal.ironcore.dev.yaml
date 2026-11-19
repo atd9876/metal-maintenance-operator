@@ -73,6 +73,7 @@ spec:
                 enum:
                 - Enabled
                 - Disabled
+                - FactoryDefault
                 type: string
               keySecretRef:
                 description: |-
@@ -277,6 +278,8 @@ spec:
                 - Enabling
                 - Enabled
                 - Disabled
+                - ResettingKeys
+                - FactoryDefault
                 - Failed
                 type: string
               serverMaintenanceRef:
@@ -303,6 +306,8 @@ spec:
                 - Enabling
                 - Enabled
                 - Disabled
+                - ResettingKeys
+                - FactoryDefault
                 - Failed
                 type: string
             type: object

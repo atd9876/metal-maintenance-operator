@@ -49,6 +49,13 @@ func isBMCLocked(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "409")
 }
 
+// isBMCBusy returns true when the BMC is temporarily unavailable (HTTP 503).
+// This happens on Dell iDRAC during POST when the system is mid-boot; callers
+// should requeue rather than fail permanently.
+func isBMCBusy(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "503")
+}
+
 // SecureBootConfigReconciler reconciles a SecureBootConfig object.
 type SecureBootConfigReconciler struct {
 	client.Client
@@ -150,6 +157,7 @@ func needsBMC(state systemv1alpha1.SecureBootConfigState) bool {
 	case systemv1alpha1.SecureBootConfigStateClearingKeys,
 		systemv1alpha1.SecureBootConfigStateEnrolling,
 		systemv1alpha1.SecureBootConfigStateEnabling,
+		systemv1alpha1.SecureBootConfigStateResettingKeys,
 		systemv1alpha1.SecureBootConfigStateEnabled,
 		"", systemv1alpha1.SecureBootConfigStatePending:
 		return true
@@ -177,11 +185,17 @@ func (r *SecureBootConfigReconciler) transitionState(ctx context.Context, sbc *s
 	case systemv1alpha1.SecureBootConfigStateEnabling:
 		return r.handleEnabling(ctx, sbc, server, bmcClient)
 
+	case systemv1alpha1.SecureBootConfigStateResettingKeys:
+		return r.handleResettingKeys(ctx, sbc, server, bmcClient)
+
 	case systemv1alpha1.SecureBootConfigStateEnabled:
 		return r.handleEnabled(ctx, sbc, server, bmcClient)
 
 	case systemv1alpha1.SecureBootConfigStateDisabled:
 		return r.handleDisabled(ctx, sbc)
+
+	case systemv1alpha1.SecureBootConfigStateFactoryDefault:
+		return r.handleFactoryDefault(ctx, sbc)
 
 	case systemv1alpha1.SecureBootConfigStateFailed:
 		return r.handleFailed(ctx, sbc)
@@ -218,6 +232,10 @@ func (r *SecureBootConfigReconciler) handlePending(ctx context.Context, sbc *sys
 		if errors.Is(err, bmc.ErrNotSupported) {
 			return r.failWith(ctx, sbc, constants.ReasonSBNotSupported, "BMC does not support Secure Boot management")
 		}
+		if isBMCBusy(err) {
+			log.V(1).Info("BMC busy reading Secure Boot state in Pending — retrying", "error", err)
+			return nil
+		}
 		return fmt.Errorf("failed to read Secure Boot state: %w", err)
 	}
 
@@ -232,6 +250,14 @@ func (r *SecureBootConfigReconciler) handlePending(ctx context.Context, sbc *sys
 			return r.updateState(ctx, sbc, systemv1alpha1.SecureBootConfigStateDisabled, nil)
 		}
 		return r.updateState(ctx, sbc, systemv1alpha1.SecureBootConfigStateClearingKeys, nil)
+	}
+
+	if desired == systemv1alpha1.SecureBootDesiredStateFactoryDefault {
+		if !sbState.Enabled && sbState.Policy == bmc.SecureBootPolicyStandard {
+			log.V(1).Info("Secure Boot already at factory default — transitioning to FactoryDefault")
+			return r.updateState(ctx, sbc, systemv1alpha1.SecureBootConfigStateFactoryDefault, nil)
+		}
+		return r.updateState(ctx, sbc, systemv1alpha1.SecureBootConfigStateResettingKeys, nil)
 	}
 
 	// DesiredState = Enabled
@@ -272,15 +298,30 @@ func (r *SecureBootConfigReconciler) handleClearingKeys(ctx context.Context, sbc
 	}
 
 	if sbc.Status.RebootIssuedForState != systemv1alpha1.SecureBootConfigStateClearingKeys {
-		// Phase A: disable SB then reset all keys.
+		// Phase A: ensure the platform permits custom key enrollment, disable SB,
+		// then reset all keys.
+		if err := sbManager.EnsureCustomKeyPolicy(ctx, server.Spec.SystemURI); err != nil {
+			if isBMCBusy(err) {
+				log.V(1).Info("BMC busy (503) during EnsureCustomKeyPolicy — retrying", "error", err)
+				return nil
+			}
+			return r.failWith(ctx, sbc, constants.ReasonSBClearFailed, fmt.Sprintf("failed to set custom key policy: %v", err))
+		}
 		if err := sbManager.SetSecureBootEnabled(ctx, server.Spec.SystemURI, false); err != nil {
+			if isBMCBusy(err) {
+				log.V(1).Info("BMC busy (503) during SetSecureBootEnabled(false) in ClearingKeys — retrying", "error", err)
+				return nil
+			}
 			return r.failWith(ctx, sbc, constants.ReasonSBClearFailed, fmt.Sprintf("failed to disable Secure Boot: %v", err))
 		}
 		if err := sbManager.ResetSecureBootKeys(ctx, server.Spec.SystemURI, bmc.SecureBootResetDeleteAllKeys); err != nil {
 			return r.failWith(ctx, sbc, constants.ReasonSBClearFailed, fmt.Sprintf("failed to reset Secure Boot keys: %v", err))
 		}
+		if err := bmcClient.SetBootOverrideContinuous(ctx, server.Spec.SystemURI); err != nil {
+			log.V(1).Info("Could not set continuous PXE override; rebooting without it", "error", err)
+		}
 		log.V(1).Info("Secure Boot disabled and keys cleared — issuing reboot")
-		if err := bmcClient.Reset(ctx, server.Spec.SystemURI, schemas.GracefulRestartResetType); err != nil {
+		if err := r.rebootServer(ctx, server, bmcClient); err != nil {
 			return fmt.Errorf("failed to reboot server: %w", err)
 		}
 		return r.markRebootIssued(ctx, sbc)
@@ -289,6 +330,10 @@ func (r *SecureBootConfigReconciler) handleClearingKeys(ctx context.Context, sbc
 	// Phase B: verify SetupMode after reboot.
 	sbState, err := sbManager.GetSecureBootState(ctx, server.Spec.SystemURI)
 	if err != nil {
+		if isBMCBusy(err) {
+			log.V(1).Info("BMC busy reading Secure Boot state in ClearingKeys — retrying", "error", err)
+			return nil
+		}
 		return fmt.Errorf("failed to read Secure Boot state post-reboot: %w", err)
 	}
 	if sbState.Mode != bmc.SecureBootModeSetup {
@@ -311,6 +356,9 @@ func (r *SecureBootConfigReconciler) handleClearingKeys(ctx context.Context, sbc
 
 	desired := sbc.Spec.DesiredState
 	if desired == systemv1alpha1.SecureBootDesiredStateDisabled {
+		if err := bmcClient.DisableBootOverride(ctx, server.Spec.SystemURI); err != nil {
+			log.V(1).Info("Could not clear PXE override after disabling Secure Boot", "error", err)
+		}
 		if err := r.patchServerLabel(ctx, server, "false"); err != nil {
 			return err
 		}
@@ -323,9 +371,8 @@ func (r *SecureBootConfigReconciler) handleClearingKeys(ctx context.Context, sbc
 		return r.updateStateWithCondition(ctx, sbc, systemv1alpha1.SecureBootConfigStateDisabled, keysClearedCond)
 	}
 
-	if err := r.cleanupServerMaintenance(ctx, sbc); err != nil {
-		return err
-	}
+	// Keep the ServerMaintenance alive so handleEnrolling reuses the same maintenance
+	// window without an extra park/unpark cycle between clearing and enrollment.
 	return r.updateStateWithCondition(ctx, sbc, systemv1alpha1.SecureBootConfigStateEnrolling, keysClearedCond)
 }
 
@@ -359,7 +406,7 @@ func (r *SecureBootConfigReconciler) handleEnrolling(ctx context.Context, sbc *s
 		}
 
 		log.V(1).Info("Keys enrolled — issuing reboot to commit")
-		if err := bmcClient.Reset(ctx, server.Spec.SystemURI, schemas.GracefulRestartResetType); err != nil {
+		if err := r.rebootServer(ctx, server, bmcClient); err != nil {
 			return fmt.Errorf("failed to reboot server post-enrollment: %w", err)
 		}
 		return r.markRebootIssued(ctx, sbc)
@@ -368,6 +415,10 @@ func (r *SecureBootConfigReconciler) handleEnrolling(ctx context.Context, sbc *s
 	// Verify UserMode after reboot.
 	sbState, err := sbManager.GetSecureBootState(ctx, server.Spec.SystemURI)
 	if err != nil {
+		if isBMCBusy(err) {
+			log.V(1).Info("BMC busy reading Secure Boot state in Enrolling — retrying", "error", err)
+			return nil
+		}
 		return fmt.Errorf("failed to read Secure Boot state post-enrollment: %w", err)
 	}
 	if sbState.Mode != bmc.SecureBootModeUser {
@@ -430,32 +481,34 @@ func (r *SecureBootConfigReconciler) handleEnabling(ctx context.Context, sbc *sy
 
 	if sbc.Status.RebootIssuedForState != systemv1alpha1.SecureBootConfigStateEnabling {
 		if err := sbManager.SetSecureBootEnabled(ctx, server.Spec.SystemURI, true); err != nil {
+			if isBMCBusy(err) {
+				log.V(1).Info("BMC busy (503) during SetSecureBootEnabled(true) — retrying", "error", err)
+				return nil
+			}
 			return r.failWith(ctx, sbc, constants.ReasonSBEnrollFailed, fmt.Sprintf("failed to enable Secure Boot: %v", err))
 		}
 		log.V(1).Info("Secure Boot enabled — issuing reboot")
-		if err := bmcClient.Reset(ctx, server.Spec.SystemURI, schemas.GracefulRestartResetType); err != nil {
+		if err := r.rebootServer(ctx, server, bmcClient); err != nil {
 			return fmt.Errorf("failed to reboot server to activate Secure Boot: %w", err)
 		}
 		return r.markRebootIssued(ctx, sbc)
 	}
 
-	// Verify CurrentBoot=true after reboot. Query BMC directly — server.Status.PowerState
-	// is not refreshed while parked (mirrors metal-operator behavior), so it is stale.
-	on, err := utils.IsServerInPowerState(ctx, bmcClient, server, metalv1alpha1.ServerOnPowerState)
-	if err != nil {
-		return fmt.Errorf("failed to check server power state: %w", err)
-	}
-	if !on {
-		log.V(1).Info("Waiting for server to power on")
-		return nil
-	}
-
+	// Verify Secure Boot is active after the reboot. Poll the SecureBoot state
+	// directly rather than waiting for PowerState=On: on Dell the enable commits
+	// during POST, and a host with no bootable OS (or one that panics) never
+	// sustains a powered-on state, so gating on power-on would wait forever.
 	sbState, err := sbManager.GetSecureBootState(ctx, server.Spec.SystemURI)
 	if err != nil {
+		if isBMCBusy(err) {
+			log.V(1).Info("BMC busy reading Secure Boot state in Enabling — retrying", "error", err)
+			return nil
+		}
 		return fmt.Errorf("failed to read Secure Boot state after enabling: %w", err)
 	}
-	if !sbState.EnabledOnBoot {
-		return r.failWith(ctx, sbc, constants.ReasonSBEnrollFailed, "Secure Boot flag set but CurrentBoot=false after reboot")
+	if !sbState.Enabled {
+		log.V(1).Info("Waiting for Secure Boot to be enabled after reboot", "mode", sbState.Mode)
+		return nil
 	}
 
 	sbEnabledCond, err := utils.GetCondition(r.Conditions, sbc.Status.Conditions, constants.ConditionSBEnabled)
@@ -470,6 +523,9 @@ func (r *SecureBootConfigReconciler) handleEnabling(ctx context.Context, sbc *sy
 		return err
 	}
 
+	if err := bmcClient.DisableBootOverride(ctx, server.Spec.SystemURI); err != nil {
+		log.V(1).Info("Could not clear PXE override after enabling Secure Boot", "error", err)
+	}
 	if err := r.patchServerLabel(ctx, server, "true"); err != nil {
 		return err
 	}
@@ -513,8 +569,8 @@ func (r *SecureBootConfigReconciler) handleEnabled(ctx context.Context, sbc *sys
 		return err
 	}
 
-	if sbc.Spec.DesiredState == systemv1alpha1.SecureBootDesiredStateDisabled {
-		log.V(1).Info("DesiredState changed to Disabled — transitioning to Pending")
+	if sbc.Spec.DesiredState != "" && sbc.Spec.DesiredState != systemv1alpha1.SecureBootDesiredStateEnabled {
+		log.V(1).Info("DesiredState changed away from Enabled — transitioning to Pending", "desiredState", sbc.Spec.DesiredState)
 		return r.updateState(ctx, sbc, systemv1alpha1.SecureBootConfigStatePending, nil)
 	}
 
@@ -572,7 +628,105 @@ func (r *SecureBootConfigReconciler) handleEnabled(ctx context.Context, sbc *sys
 }
 
 func (r *SecureBootConfigReconciler) handleDisabled(ctx context.Context, sbc *systemv1alpha1.SecureBootConfig) error {
-	if sbc.Spec.DesiredState == systemv1alpha1.SecureBootDesiredStateEnabled {
+	if sbc.Spec.DesiredState != systemv1alpha1.SecureBootDesiredStateDisabled {
+		return r.updateState(ctx, sbc, systemv1alpha1.SecureBootConfigStatePending, nil)
+	}
+	return nil
+}
+
+// handleResettingKeys drives DesiredState=FactoryDefault: it issues
+// ResetAllKeysToDefault, reboots, and confirms the factory keys are restored with
+// Secure Boot disabled. Unlike ClearingKeys it does NOT ensure a custom key
+// policy — the factory reset deliberately returns the server to its shipped
+// (Standard) policy and vendor keys.
+func (r *SecureBootConfigReconciler) handleResettingKeys(ctx context.Context, sbc *systemv1alpha1.SecureBootConfig, server *metalv1alpha1.Server, bmcClient bmc.BMC) error {
+	log := ctrl.LoggerFrom(ctx)
+
+	sbManager, err := r.getSecureBootManager(ctx, sbc, bmcClient)
+	if err != nil {
+		return err
+	}
+
+	active, err := r.ensureMaintenance(ctx, sbc, server)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return nil // waiting for maintenance window
+	}
+
+	if sbc.Status.RebootIssuedForState != systemv1alpha1.SecureBootConfigStateResettingKeys {
+		if err := sbManager.ResetSecureBootKeys(ctx, server.Spec.SystemURI, bmc.SecureBootResetResetAllKeysToDefault); err != nil {
+			return r.failWith(ctx, sbc, constants.ReasonSBFactoryResetFailed, fmt.Sprintf("failed to reset keys to factory default: %v", err))
+		}
+		// ResetAllKeysToDefault restores the factory keys but, on Dell, leaves
+		// Secure Boot enabled against them. FactoryDefault must end with Secure Boot
+		// OFF (so a Microsoft-signed firmware update cannot be blocked), so disable
+		// it explicitly in the same staged batch.
+		if err := sbManager.SetSecureBootEnabled(ctx, server.Spec.SystemURI, false); err != nil {
+			if isBMCBusy(err) {
+				log.V(1).Info("BMC busy (503) during SetSecureBootEnabled(false) in ResettingKeys — retrying", "error", err)
+				return nil
+			}
+			return r.failWith(ctx, sbc, constants.ReasonSBFactoryResetFailed, fmt.Sprintf("failed to disable Secure Boot: %v", err))
+		}
+		if err := bmcClient.SetBootOverrideContinuous(ctx, server.Spec.SystemURI); err != nil {
+			log.V(1).Info("Could not set continuous PXE override; rebooting without it", "error", err)
+		}
+		log.V(1).Info("Keys reset to factory default and Secure Boot disabled — issuing reboot to commit")
+		if err := r.rebootServer(ctx, server, bmcClient); err != nil {
+			return fmt.Errorf("failed to reboot server: %w", err)
+		}
+		return r.markRebootIssued(ctx, sbc)
+	}
+
+	// Verify Secure Boot is off after the reset reboot. On the tested Dell,
+	// ResetAllKeysToDefault leaves SecureBootEnable=false with the factory keys
+	// restored, so the enable flag is the reliable commit signal.
+	sbState, err := sbManager.GetSecureBootState(ctx, server.Spec.SystemURI)
+	if err != nil {
+		if isBMCBusy(err) {
+			log.V(1).Info("BMC busy reading Secure Boot state in ResettingKeys — retrying", "error", err)
+			return nil
+		}
+		return fmt.Errorf("failed to read Secure Boot state post-reboot: %w", err)
+	}
+	if sbState.Enabled {
+		log.V(1).Info("Waiting for Secure Boot off after factory reset", "enabled", sbState.Enabled)
+		return nil
+	}
+
+	factoryCond, err := utils.GetCondition(r.Conditions, sbc.Status.Conditions, constants.ConditionSBFactoryDefault)
+	if err != nil {
+		return err
+	}
+	if err := r.Conditions.Update(factoryCond,
+		conditionutils.UpdateStatus(metav1.ConditionTrue),
+		conditionutils.UpdateReason(constants.ReasonSBFactoryReset),
+		conditionutils.UpdateMessage("Factory keys restored — Secure Boot off"),
+	); err != nil {
+		return err
+	}
+
+	if err := bmcClient.DisableBootOverride(ctx, server.Spec.SystemURI); err != nil {
+		log.V(1).Info("Could not clear PXE override after factory reset", "error", err)
+	}
+	if err := r.patchServerLabel(ctx, server, "false"); err != nil {
+		return err
+	}
+	if err := r.patchCompletionCondition(ctx, sbc, server); err != nil {
+		return err
+	}
+	if err := r.cleanupServerMaintenance(ctx, sbc); err != nil {
+		return err
+	}
+	return r.updateStateWithCondition(ctx, sbc, systemv1alpha1.SecureBootConfigStateFactoryDefault, factoryCond)
+}
+
+// handleFactoryDefault is the terminal steady state for DesiredState=FactoryDefault.
+// A spec change to Enabled or Disabled re-evaluates from Pending.
+func (r *SecureBootConfigReconciler) handleFactoryDefault(ctx context.Context, sbc *systemv1alpha1.SecureBootConfig) error {
+	if sbc.Spec.DesiredState != systemv1alpha1.SecureBootDesiredStateFactoryDefault {
 		return r.updateState(ctx, sbc, systemv1alpha1.SecureBootConfigStatePending, nil)
 	}
 	return nil
@@ -750,6 +904,21 @@ func (r *SecureBootConfigReconciler) updateStateWithCondition(ctx context.Contex
 		}
 	}
 	return r.Status().Patch(ctx, sbc, client.MergeFrom(base))
+}
+
+// rebootServer cycles the host to commit staged BIOS/Secure Boot changes.
+// Uses ForceRestart (not GracefulRestart) so it works even with no OS, and
+// powers on instead of restarting when the host is currently off.
+func (r *SecureBootConfigReconciler) rebootServer(ctx context.Context, server *metalv1alpha1.Server, bmcClient bmc.BMC) error {
+	on, err := utils.IsServerInPowerState(ctx, bmcClient, server, metalv1alpha1.ServerOnPowerState)
+	if err != nil {
+		return fmt.Errorf("failed to check server power state: %w", err)
+	}
+	resetType := schemas.ForceRestartResetType
+	if !on {
+		resetType = schemas.OnResetType
+	}
+	return bmcClient.Reset(ctx, server.Spec.SystemURI, resetType)
 }
 
 // markRebootIssued persists that a BMC reboot was issued for the current state.

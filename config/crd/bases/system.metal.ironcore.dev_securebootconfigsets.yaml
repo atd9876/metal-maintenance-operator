@@ -70,6 +70,7 @@ spec:
                     enum:
                     - Enabled
                     - Disabled
+                    - FactoryDefault
                     type: string
                   keySecretRef:
                     description: KeySecretRef names the Secret holding the Secure

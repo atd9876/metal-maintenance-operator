@@ -194,6 +194,8 @@ rules:
   - biosversions
   - biosversionsets
   - firmwareupdates
+  - securebootconfigs
+  - securebootconfigsets
   verbs:
   - create
   - delete
@@ -210,6 +212,8 @@ rules:
   - biosversions/finalizers
   - biosversionsets/finalizers
   - firmwareupdates/finalizers
+  - securebootconfigs/finalizers
+  - securebootconfigsets/finalizers
   verbs:
   - update
 - apiGroups:
@@ -220,6 +224,8 @@ rules:
   - biosversions/status
   - biosversionsets/status
   - firmwareupdates/status
+  - securebootconfigs/status
+  - securebootconfigsets/status
   verbs:
   - get
   - patch

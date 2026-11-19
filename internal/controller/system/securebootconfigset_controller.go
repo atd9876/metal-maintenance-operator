@@ -300,14 +300,17 @@ func (r *SecureBootConfigSetReconciler) computeStatus(owned *systemv1alpha1.Secu
 	}
 	for _, sbc := range owned.Items {
 		switch sbc.Status.State {
-		case systemv1alpha1.SecureBootConfigStateEnabled, systemv1alpha1.SecureBootConfigStateDisabled:
+		case systemv1alpha1.SecureBootConfigStateEnabled,
+			systemv1alpha1.SecureBootConfigStateDisabled,
+			systemv1alpha1.SecureBootConfigStateFactoryDefault:
 			s.CompletedSecureBootConfigs++
 		case systemv1alpha1.SecureBootConfigStateFailed:
 			s.FailedSecureBootConfigs++
 		case systemv1alpha1.SecureBootConfigStateClearingKeys,
 			systemv1alpha1.SecureBootConfigStateEnrolling,
 			systemv1alpha1.SecureBootConfigStateEnrolled,
-			systemv1alpha1.SecureBootConfigStateEnabling:
+			systemv1alpha1.SecureBootConfigStateEnabling,
+			systemv1alpha1.SecureBootConfigStateResettingKeys:
 			s.InProgressSecureBootConfigs++
 		default:
 			s.PendingSecureBootConfigs++

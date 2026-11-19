@@ -214,7 +214,12 @@ var _ = Describe("SecureBootConfig Controller", func() {
 		(*ms).SetSecureBootCurrentBoot(mockSystemPath, true)
 		(*ms).SetSecureBootMode(mockSystemPath, "UserMode")
 
-		By("Waiting for Enabling → Enabled states")
+		By("Waiting for Enabling state")
+		Eventually(Object(sbc)).Should(
+			HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnabling),
+		)
+
+		By("Waiting for Enabled state")
 		Eventually(Object(sbc)).Should(
 			HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnabled),
 		)
@@ -271,6 +276,106 @@ var _ = Describe("SecureBootConfig Controller", func() {
 		Eventually(Get(sbc)).Should(Satisfy(apierrors.IsNotFound))
 	})
 
+	It("should reach FactoryDefault state when desiredState=FactoryDefault", func(ctx SpecContext) {
+		By("Configuring mock: UserMode with SB enabled (needs factory reset)")
+		(*ms).SetSecureBootMode(mockSystemPath, "UserMode")
+		(*ms).SetSecureBootEnable(mockSystemPath, true)
+
+		By("Creating a SecureBootConfig with DesiredState=FactoryDefault")
+		sbc := &systemv1alpha1.SecureBootConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "test-sb-",
+				Namespace:    ns.Name,
+			},
+			Spec: systemv1alpha1.SecureBootConfigSpec{
+				ServerRef:    &corev1.LocalObjectReference{Name: server.Name},
+				KeySecretRef: corev1.LocalObjectReference{Name: keySecret.Name},
+				DesiredState: systemv1alpha1.SecureBootDesiredStateFactoryDefault,
+			},
+		}
+		Expect(k8sClient.Create(ctx, sbc)).To(Succeed())
+
+		By("Waiting for ResettingKeys state")
+		Eventually(Object(sbc)).Should(
+			HaveField("Status.State", systemv1alpha1.SecureBootConfigStateResettingKeys),
+		)
+
+		By("Waiting for Secure Boot to be disabled on mock after factory reset")
+		Eventually(func() bool {
+			return (*ms).GetSecureBootState(mockSystemPath).Enabled
+		}).Should(BeFalse())
+
+		By("Waiting for FactoryDefault state")
+		Eventually(Object(sbc)).Should(
+			HaveField("Status.State", systemv1alpha1.SecureBootConfigStateFactoryDefault),
+		)
+
+		By("Verifying server label is set to false")
+		Eventually(Object(server)).Should(
+			HaveField("Labels", HaveKeyWithValue(labelSecureBootEnabled, "false")),
+		)
+
+		By("Cleaning up")
+		Expect(k8sClient.Delete(ctx, sbc)).To(Succeed())
+		Eventually(Get(sbc)).Should(Satisfy(apierrors.IsNotFound))
+	})
+
+	It("should transition Enabled → FactoryDefault when desiredState is changed", func(ctx SpecContext) {
+		By("Reaching Enabled from SetupMode")
+		(*ms).SetSecureBootMode(mockSystemPath, "SetupMode")
+
+		sbc := &systemv1alpha1.SecureBootConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "test-sb-",
+				Namespace:    ns.Name,
+			},
+			Spec: systemv1alpha1.SecureBootConfigSpec{
+				ServerRef:    &corev1.LocalObjectReference{Name: server.Name},
+				KeySecretRef: corev1.LocalObjectReference{Name: keySecret.Name},
+				DesiredState: systemv1alpha1.SecureBootDesiredStateEnabled,
+			},
+		}
+		Expect(k8sClient.Create(ctx, sbc)).To(Succeed())
+
+		Eventually(Object(sbc)).Should(
+			HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnrolling),
+		)
+		By("Simulating post-enrollment reboot")
+		(*ms).SetSecureBootCurrentBoot(mockSystemPath, true)
+		(*ms).SetSecureBootEnable(mockSystemPath, true)
+		(*ms).SetSecureBootMode(mockSystemPath, "UserMode")
+		Eventually(Object(sbc)).Should(
+			HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnabling),
+		)
+		Eventually(Object(sbc)).Should(
+			HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnabled),
+		)
+
+		By("Changing DesiredState to FactoryDefault")
+		Eventually(Update(sbc, func() {
+			sbc.Spec.DesiredState = systemv1alpha1.SecureBootDesiredStateFactoryDefault
+		})).Should(Succeed())
+
+		By("Waiting for ResettingKeys state")
+		Eventually(Object(sbc)).Should(
+			HaveField("Status.State", systemv1alpha1.SecureBootConfigStateResettingKeys),
+		)
+
+		By("Waiting for Secure Boot disabled on mock after factory reset")
+		Eventually(func() bool {
+			return (*ms).GetSecureBootState(mockSystemPath).Enabled
+		}).Should(BeFalse())
+
+		By("Waiting for FactoryDefault state")
+		Eventually(Object(sbc)).Should(
+			HaveField("Status.State", systemv1alpha1.SecureBootConfigStateFactoryDefault),
+		)
+
+		By("Cleaning up")
+		Expect(k8sClient.Delete(ctx, sbc)).To(Succeed())
+		Eventually(Get(sbc)).Should(Satisfy(apierrors.IsNotFound))
+	})
+
 	// ──────────────────────────────────────────────────────────────────────────
 	// Disabled → Enabled transition on DesiredState change
 	// ──────────────────────────────────────────────────────────────────────────
@@ -312,9 +417,8 @@ var _ = Describe("SecureBootConfig Controller", func() {
 		(*ms).SetSecureBootCurrentBoot(mockSystemPath, true)
 		(*ms).SetSecureBootMode(mockSystemPath, "UserMode")
 
-		Eventually(Object(sbc)).Should(
-			HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnabled),
-		)
+		Eventually(Object(sbc)).Should(HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnabling))
+		Eventually(Object(sbc)).Should(HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnabled))
 
 		By("Cleaning up")
 		Expect(k8sClient.Delete(ctx, sbc)).To(Succeed())
@@ -346,6 +450,7 @@ var _ = Describe("SecureBootConfig Controller", func() {
 		Eventually(Object(sbc)).Should(HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnrolling))
 		(*ms).SetSecureBootCurrentBoot(mockSystemPath, true)
 		(*ms).SetSecureBootMode(mockSystemPath, "UserMode")
+		Eventually(Object(sbc)).Should(HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnabling))
 		Eventually(Object(sbc)).Should(HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnabled))
 
 		By("Simulating hardware drift: SB disabled on BMC")
@@ -427,6 +532,7 @@ var _ = Describe("SecureBootConfig Controller", func() {
 		By("Simulating post-enrollment reboot")
 		(*ms).SetSecureBootCurrentBoot(mockSystemPath, true)
 		(*ms).SetSecureBootMode(mockSystemPath, "UserMode")
+		Eventually(Object(sbc)).Should(HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnabling))
 		Eventually(Object(sbc)).Should(HaveField("Status.State", systemv1alpha1.SecureBootConfigStateEnabled))
 
 		By("Cleaning up")
