@@ -49,11 +49,15 @@ func isBMCLocked(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "409")
 }
 
-// isBMCBusy returns true when the BMC is temporarily unavailable (HTTP 503).
-// This happens on Dell iDRAC during POST when the system is mid-boot; callers
-// should requeue rather than fail permanently.
+// isBMCBusy returns true when the BMC is temporarily busy and the operation
+// should be retried rather than failed permanently. Covers:
+//   - HTTP 503: Dell iDRAC busy (e.g. mid-boot Settings resource).
+//   - UnableToModifyDuringSystemPOST: HPE iLO rejects SB changes while the
+//     system is in POST; the caller should wait and retry.
 func isBMCBusy(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "503")
+	return err != nil && (strings.Contains(err.Error(), "503") ||
+		strings.Contains(err.Error(), "UnableToModifyDuringSystemPOST") ||
+		strings.Contains(err.Error(), "EOF"))
 }
 
 // SecureBootConfigReconciler reconciles a SecureBootConfig object.
@@ -315,6 +319,10 @@ func (r *SecureBootConfigReconciler) handleClearingKeys(ctx context.Context, sbc
 			return r.failWith(ctx, sbc, constants.ReasonSBClearFailed, fmt.Sprintf("failed to disable Secure Boot: %v", err))
 		}
 		if err := sbManager.ResetSecureBootKeys(ctx, server.Spec.SystemURI, bmc.SecureBootResetDeleteAllKeys); err != nil {
+			if isBMCBusy(err) {
+				log.V(1).Info("BMC busy during ResetSecureBootKeys in ClearingKeys — retrying", "error", err)
+				return nil
+			}
 			return r.failWith(ctx, sbc, constants.ReasonSBClearFailed, fmt.Sprintf("failed to reset Secure Boot keys: %v", err))
 		}
 		if err := bmcClient.SetBootOverrideContinuous(ctx, server.Spec.SystemURI); err != nil {
@@ -402,6 +410,10 @@ func (r *SecureBootConfigReconciler) handleEnrolling(ctx context.Context, sbc *s
 		}
 
 		if err := r.enrollKeys(ctx, sbc, server, sbManager, keySecret); err != nil {
+			if isBMCBusy(err) {
+				log.V(1).Info("BMC busy during key enrollment — retrying", "error", err)
+				return nil
+			}
 			return r.failWith(ctx, sbc, constants.ReasonSBEnrollFailed, fmt.Sprintf("key enrollment failed: %v", err))
 		}
 
@@ -657,6 +669,10 @@ func (r *SecureBootConfigReconciler) handleResettingKeys(ctx context.Context, sb
 
 	if sbc.Status.RebootIssuedForState != systemv1alpha1.SecureBootConfigStateResettingKeys {
 		if err := sbManager.ResetSecureBootKeys(ctx, server.Spec.SystemURI, bmc.SecureBootResetResetAllKeysToDefault); err != nil {
+			if isBMCBusy(err) {
+				log.V(1).Info("BMC busy during ResetSecureBootKeys in ResettingKeys — retrying", "error", err)
+				return nil
+			}
 			return r.failWith(ctx, sbc, constants.ReasonSBFactoryResetFailed, fmt.Sprintf("failed to reset keys to factory default: %v", err))
 		}
 		// ResetAllKeysToDefault restores the factory keys but, on Dell, leaves
